@@ -1,6 +1,8 @@
 
 
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
+-- Full script URL (used by Auto Re-Execute on respawn)
+local SCRIPT_URL     = "https://raw.githubusercontent.com/headshot7535-png/Untitled-Melee-RNG/main/Untitled%20Melee%20RNG"
 
 -- ── Load NexusLib ─────────────────────────────────────────────
 local Lib
@@ -288,9 +290,12 @@ local states = {
     autoSave       = true,
     showAutoRaid   = false,
     showHideMobs   = false,
+    autoReExec     = false,
+    hitboxPulse    = false,
 }
 
 local walkSpeedVal   = 16
+local hitboxSize     = 100000
 local flyBV, flyBG
 local espBillboards  = {}
 
@@ -302,8 +307,12 @@ local function saveSettings()
         for k, v in pairs(states) do t[k] = v end
         t.walkSpeedVal = walkSpeedVal
         t.upgradeSelected = upgradeSelected
+        t.hitboxSize = hitboxSize
         writefile(SETTINGS_FILE, HttpService:JSONEncode(t))
     end)
+end
+local function forceSave()
+    saveSettings()
 end
 local LS = {}
 pcall(function()
@@ -319,6 +328,28 @@ if LS.walkSpeedVal then walkSpeedVal = LS.walkSpeedVal end
 if LS.autoSave     then states.autoSave     = LS.autoSave     end
 if LS.showAutoRaid then states.showAutoRaid = LS.showAutoRaid end
 if LS.showHideMobs then states.showHideMobs = LS.showHideMobs end
+if LS.hitboxSize ~= nil then
+    local n = tonumber(LS.hitboxSize)
+    if n then hitboxSize = math.max(10, math.min(100000, math.floor(n))) end
+end
+
+-- Auto Re-Execute: reload full script from GitHub on respawn (not on the first character spawn after inject)
+local _reExecSeenChar = LP.Character ~= nil
+addConn(LP.CharacterAdded:Connect(function()
+    if not _reExecSeenChar then
+        _reExecSeenChar = true
+        return
+    end
+    if not states.autoReExec then return end
+    task.spawn(function()
+        task.wait(2)
+        if not states.autoReExec then return end
+        local ok, err = pcall(function()
+            loadstring(game:HttpGet(SCRIPT_URL))()
+        end)
+        if not ok then warn("[MeleeRNG] Auto Re-Execute failed: " .. tostring(err)) end
+    end)
+end))
 
 -- ============================================================
 --  BUILD WINDOW
@@ -573,15 +604,15 @@ MoveTab:Section("Hitbox Pulse (Kill Exploit)")
 MoveTab:Label("Touched fires on SIZE CHANGE not static overlap. Static expand does nothing. Pulse oscillates big/tiny every tick — fires Touched on all mobs continuously.")
 
 MoveTab:Slider("Hitbox Size", "Studs radius for the big phase — larger = more mobs hit",
-    {min=10, max=100000, default=100000,
+    {min=10, max=100000, default=hitboxSize,
      format=function(v) return math.floor(v).." studs" end},
     function(v)
         hitboxSize = math.floor(v)
+        saveSettings()
     end)
 
 -- Cache hitbox parts so we don't scan descendants every frame
 -- ── Hitbox pulse variables ────────────────────────────────────────────────
-local hitboxSize      = 100000
 local farmDmgBase     = 9999  -- damage per hit sent with direct HitMob batch
 local hitboxExpanded  = false
 local hitboxOrigSizes = {}
@@ -642,7 +673,7 @@ addThread(task.spawn(function()
     end
 end))
 
-MoveTab:Toggle("⚡ Hitbox Pulse", "Every Heartbeat frame: flips all Hitbox parts big/tiny — fires Touched each flip", false, function(on)
+local function setHitboxPulse(on)
     _pulseActive = on
     hitboxExpanded = on
     if on then
@@ -671,7 +702,6 @@ MoveTab:Toggle("⚡ Hitbox Pulse", "Every Heartbeat frame: flips all Hitbox part
             end
 
             -- Flip ALL hitbox parts this frame — no throttle, every Heartbeat
-            -- _bigV rebuilt every frame so slider changes apply immediately
             _pulsePhase = not _pulsePhase
             local newSize = _pulsePhase
                 and Vector3.new(hitboxSize, hitboxSize, hitboxSize)
@@ -703,7 +733,6 @@ MoveTab:Toggle("⚡ Hitbox Pulse", "Every Heartbeat frame: flips all Hitbox part
         SLbl.Text = string.format("⚡ Pulse ON — every frame at %.0f studs (%d hitboxes)", hitboxSize, #_hitboxCache)
     else
         if _pulseConn then _pulseConn:Disconnect(); _pulseConn = nil end
-        -- Restore originals
         for i = 1, #_hitboxCache do
             local hb = _hitboxCache[i]
             if hb and hb.Parent and hitboxOrigSizes[hb] then
@@ -712,6 +741,23 @@ MoveTab:Toggle("⚡ Hitbox Pulse", "Every Heartbeat frame: flips all Hitbox part
         end
         _hitboxCache = {}
         SLbl.Text = "Pulse OFF — hitboxes restored"
+    end
+end
+
+local hitboxPulseToggle = MoveTab:Toggle("⚡ Hitbox Pulse", "Every Heartbeat frame: flips all Hitbox parts big/tiny — fires Touched each flip", states.hitboxPulse, function(on)
+    states.hitboxPulse = on
+    setHitboxPulse(on)
+    saveSettings()
+end)
+
+task.defer(function()
+    if states.hitboxPulse then
+        setHitboxPulse(true)
+        pcall(function()
+            if hitboxPulseToggle and hitboxPulseToggle.Set then
+                hitboxPulseToggle.Set(true)
+            end
+        end)
     end
 end)
 
@@ -1417,6 +1463,11 @@ MiscTab:Button("💬", "Join Discord", "Opens discord.gg/vSTmMTyw in browser", C
 end)
 
 MiscTab:Section("Script Control")
+MiscTab:Toggle("🔄 Auto Re-Execute", "After respawn, reloads this script from GitHub (Untitled Melee RNG)", states.autoReExec, function(on)
+    states.autoReExec = on
+    saveSettings()
+    SLbl.Text = on and "Auto Re-Execute ON — reloads on respawn" or "Auto Re-Execute OFF"
+end)
 MiscTab:Toggle("💾 Auto Save", "Automatically saves all toggle/slider states to disk", states.autoSave, function(on)
     states.autoSave = on
     forceSave()  -- always save the autoSave state itself
