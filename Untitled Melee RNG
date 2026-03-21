@@ -1,32 +1,4 @@
--- ============================================================
---  UNTITLED MELEE RNG EXECUTOR  v1.0  |  Powered by NexusLib
---  ⚠  Data sourced 100% from live dump — no hardcoded values
---
---  Confirmed remotes (RS.Remotes.*):
---    HitMob:FireServer(batch)           batch = {{id,dmg,weapon},...}
---    RollWeapons:InvokeServer(autoRoll) → {weapons}, luckPct, rarity
---    GetWeaponsInv:InvokeServer()       → weapon array
---    EquipBest:FireServer()
---    DropLoot:FireServer(lootRef)
---    GetArea:InvokeServer()             → current area folder
---    GetUpgradeValue:InvokeServer(name) → number
---    ConfirmAscend:InvokeServer()       → bool
---    SetSetting:FireServer(key, val)
---    GetSetting:InvokeServer(key)       → val
---
---  Confirmed workspace folders (from dump):
---    workspace.Mobs      — live mob models (ID via :GetAttribute("ID"))
---    workspace.Loot      — ground loot models
---    workspace.Areas     — biomes (SafeAreaSpawn, MinimumKills attr)
---    workspace.BossAreas — boss raid zones (BossArea.CollisionPart)
---    workspace.Machines  — interactable machines (ProximityPrompt)
---
---  Confirmed client mob table (MobsClientController u19):
---    {Name, Model, Root, Health, MaxHealth, Boss, MegaBoss, Speed, Height}
---
---  Confirmed leaderstats (emoji-prefixed, discovered at runtime):
---    "🎯 Kills" | "🌟 Ascends" | "⚠ SP" | "🟣 Mana"
--- ============================================================
+
 
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
