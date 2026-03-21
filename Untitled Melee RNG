@@ -1,7 +1,7 @@
 
 
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
--- Full script URL (used by Auto Re-Execute on respawn)
+-- Full script URL (Auto Re-Execute: executor queue_on_teleport — same idea as ANIPIXELS GUI v5.0)
 local SCRIPT_URL     = "https://raw.githubusercontent.com/headshot7535-png/Untitled-Melee-RNG/main/Untitled%20Melee%20RNG"
 
 -- ── Load NexusLib ─────────────────────────────────────────────
@@ -332,24 +332,6 @@ if LS.hitboxSize ~= nil then
     local n = tonumber(LS.hitboxSize)
     if n then hitboxSize = math.max(10, math.min(100000, math.floor(n))) end
 end
-
--- Auto Re-Execute: reload full script from GitHub on respawn (not on the first character spawn after inject)
-local _reExecSeenChar = LP.Character ~= nil
-addConn(LP.CharacterAdded:Connect(function()
-    if not _reExecSeenChar then
-        _reExecSeenChar = true
-        return
-    end
-    if not states.autoReExec then return end
-    task.spawn(function()
-        task.wait(2)
-        if not states.autoReExec then return end
-        local ok, err = pcall(function()
-            loadstring(game:HttpGet(SCRIPT_URL))()
-        end)
-        if not ok then warn("[MeleeRNG] Auto Re-Execute failed: " .. tostring(err)) end
-    end)
-end))
 
 -- ============================================================
 --  BUILD WINDOW
@@ -1463,10 +1445,10 @@ MiscTab:Button("💬", "Join Discord", "Opens discord.gg/vSTmMTyw in browser", C
 end)
 
 MiscTab:Section("Script Control")
-MiscTab:Toggle("🔄 Auto Re-Execute", "After respawn, reloads this script from GitHub (Untitled Melee RNG)", states.autoReExec, function(on)
+MiscTab:Toggle("🔁 Auto Rejoin", "Re-executes on disconnect or hop", states.autoReExec, function(on)
     states.autoReExec = on
     saveSettings()
-    SLbl.Text = on and "Auto Re-Execute ON — reloads on respawn" or "Auto Re-Execute OFF"
+    SLbl.Text = on and "Auto Rejoin ON" or "Auto Rejoin OFF"
 end)
 MiscTab:Toggle("💾 Auto Save", "Automatically saves all toggle/slider states to disk", states.autoSave, function(on)
     states.autoSave = on
@@ -1504,6 +1486,51 @@ MiscTab:Button("💾", "Save Settings", "Force-saves current toggle/slider state
     saveSettings()
     SLbl.Text = "Settings saved to " .. SETTINGS_FILE
 end)
+
+-- ── Auto re-exec (ANIPIXELS GUI v5.0 pattern: queue_on_teleport + OnTeleport) ──
+do
+    local REEXEC_URL = SCRIPT_URL
+    if _G.MeleeRNG_AutoRejoin and not states.autoReExec then
+        states.autoReExec = true
+        saveSettings()
+    end
+    local function syncMeleeRejoinFlag()
+        _G.MeleeRNG_AutoRejoin = states.autoReExec
+    end
+    syncMeleeRejoinFlag()
+    pcall(function()
+        LP.OnTeleport:Connect(function(teleportState)
+            if teleportState == Enum.TeleportState.RequestedByServer then
+                syncMeleeRejoinFlag()
+                if queue_on_teleport and states.autoReExec then
+                    pcall(function()
+                        queue_on_teleport('loadstring(game:HttpGet("' .. REEXEC_URL .. '",true))()')
+                    end)
+                end
+            end
+        end)
+    end)
+    local function armQueue()
+        pcall(function()
+            if queue_on_teleport and states.autoReExec then
+                queue_on_teleport('loadstring(game:HttpGet("' .. REEXEC_URL .. '",true))()')
+            end
+        end)
+    end
+    armQueue()
+    task.spawn(function()
+        local wasOn = false
+        while true do
+            if GEN ~= _G.MeleeRNG_Gen then break end
+            task.wait(2)
+            syncMeleeRejoinFlag()
+            if states.autoReExec and not wasOn then
+                pcall(armQueue)
+            end
+            wasOn = states.autoReExec
+        end
+    end)
+end
 
 -- ============================================================
 --  DONE
