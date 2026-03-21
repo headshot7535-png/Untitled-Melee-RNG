@@ -1,7 +1,7 @@
 
 
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
--- Full script URL (Auto Re-Execute: executor queue_on_teleport — same idea as ANIPIXELS GUI v5.0)
+-- Full script URL (Auto Re-Execute: executor queue_on_teleport — 
 local SCRIPT_URL     = "https://raw.githubusercontent.com/headshot7535-png/Untitled-Melee-RNG/main/Untitled%20Melee%20RNG"
 
 -- ── Load NexusLib ─────────────────────────────────────────────
