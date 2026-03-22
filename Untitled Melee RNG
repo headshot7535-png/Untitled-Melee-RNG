@@ -215,6 +215,7 @@ local states = {
     hitboxPulse    = false,
     hitboxDutyCycle  = 2,  -- BIG on 1 frame per N heartbeats (2 = half the frames big, old behavior; 6+ = mostly tiny, less physics lag)
     autoUpgradeOn  = false,  -- master Auto Upgrade loop (saved with other toggles)
+    autoManaToSP   = false,  -- Heartbeat: CalculateManaPrice + ConvertMana (1 unit, ~10/s cap)
     -- After ascend: TP target (HumanoidRootPart + 3 studs Y); set via Misc → Ascend
     ascendAfterTpX = DEF_ASCEND_TP_X,
     ascendAfterTpY = DEF_ASCEND_TP_Y,
@@ -310,6 +311,7 @@ end
 states.autoUpgradeOn = states.autoUpgradeOn == true
 states.autoAscend    = states.autoAscend == true
 states.autoSacrifice = states.autoSacrifice == true
+states.autoManaToSP  = states.autoManaToSP == true
 if LS.sacFilterColor ~= nil then
     states.sacFilterColor = LS.sacFilterColor == true
 elseif LS.sacFilterRarity ~= nil then
@@ -1367,6 +1369,25 @@ addConn(UserInputService.JumpRequest:Connect(function()
     end
 end))
 
+-- ── Auto Mana → SP (CalculateManaPrice / ConvertMana — 1 unit, throttled ~10/s) ──
+local _manaConvLast = 0
+addConn(RunService.Heartbeat:Connect(function()
+    if GEN ~= _G.MeleeRNG_Gen then return end
+    if not states.autoManaToSP then return end
+    local now = os.clock()
+    if now - _manaConvLast < 0.1 then return end
+    _manaConvLast = now
+    pcall(function()
+        local cost = invokeR("CalculateManaPrice", 1)
+        if cost == nil or cost == false then return end
+        local c = (typeof(cost) == "number" and cost) or tonumber(cost)
+        if c == nil or c ~= c or c < 0 then return end  -- need finite, non‑negative price
+        local m = tonumber(getMana()) or 0
+        if m < c then return end  -- not enough mana for this 1× SP step; skip remote
+        invokeR("ConvertMana", 1)
+    end)
+end))
+
 -- ── Noclip (cached BaseParts) ─────────────────────────────────
 local noclipParts, noclipConns = {}, {}
 local function clearNoclipConns()
@@ -1842,6 +1863,20 @@ MiscTab:Button("📊", "Print Upgrade Levels", "Fetches all upgrade levels via G
     SLbl.Text = "Upgrade levels printed to output"
 end)
 
+MiscTab:Section("Mana → SP")
+local manaToSpToggle = MiscTab:Toggle("⚡ Auto Mana → SP", "Convert 1 mana step at a time as fast as the server allows (~10/s). Saved with settings.", states.autoManaToSP, function(on)
+    states.autoManaToSP = on == true
+    saveSettings()
+    SLbl.Text = on and "Auto Mana→SP ON" or "Auto Mana→SP OFF"
+end)
+task.defer(function()
+    pcall(function()
+        if manaToSpToggle and manaToSpToggle.Set then
+            manaToSpToggle.Set(states.autoManaToSP)
+        end
+    end)
+end)
+
 MiscTab:Section("Community")
 MiscTab:Button("💬", "Join Discord", "Opens discord.gg/vSTmMTyw in browser", C.purple, function()
     if setclipboard then
@@ -1868,8 +1903,12 @@ end)
 MiscTab:Button("🛑", "Stop All Loops", "Disconnects all connections and cancels all threads", C.red, function()
     states.autoAscend  = false
     states.autoSacrifice = false
+    states.autoManaToSP  = false
     pcall(function()
         if sacAutoToggle and sacAutoToggle.Set then sacAutoToggle.Set(false) end
+    end)
+    pcall(function()
+        if manaToSpToggle and manaToSpToggle.Set then manaToSpToggle.Set(false) end
     end)
     states.noclip    = false; states.godMode   = false
     states.fly       = false; states.antiAfk   = false
