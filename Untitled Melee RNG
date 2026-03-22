@@ -100,6 +100,28 @@ local function getAscendKillsRequired()
     return (2 + (tonumber(getAscends()) or 0)) * 1000000
 end
 
+-- After ascend: TP once here only if leaderstats Ascends actually increased (Forgotten Valley — from [MeleeRNG] pos log)
+local ASCEND_SUCCESS_CFRAME = CFrame.new(496.9, 222.1, -7380.4)
+
+--- @return true if Ascends rose above beforeAscends and we teleported once
+local function teleportAfterAscendIfConfirmed(beforeAscends)
+    beforeAscends = tonumber(beforeAscends) or 0
+    for _ = 1, 35 do
+        task.wait(0.1)
+        local now = tonumber(getAscends()) or 0
+        if now > beforeAscends then
+            local root = getRoot()
+            if root then
+                pcall(function()
+                    root.CFrame = ASCEND_SUCCESS_CFRAME * CFrame.new(0, 3, 0)
+                end)
+            end
+            return true
+        end
+    end
+    return false
+end
+
 -- ── Remote cache ─────────────────────────────────────────────
 local _remotes = {}
 local function R(name)
@@ -212,6 +234,12 @@ local states = {
     hitboxPulse    = false,
     hitboxDutyCycle  = 2,  -- BIG on 1 frame per N heartbeats (2 = half the frames big, old behavior; 6+ = mostly tiny, less physics lag)
     autoUpgradeOn  = false,  -- master Auto Upgrade loop (saved with other toggles)
+    -- Sacrifice (Fountain) — OneIn tiers from RS.Assets.Weapons; only By color + By name
+    autoSacrifice    = false,
+    sacFilterColor   = false,  -- OneIn ≤ selected tier max (game color / rarity)
+    sacFilterName    = false,
+    sacRarityCapIdx  = 1,     -- 1–9 = dropdown tier cap (see SAC_TIERS)
+    sacKeepQty       = 0,    -- 0–999; persisted + synced on load
 }
 
 -- Upgrade names for save/load (must exist before saveSettings references upgradeSelected)
@@ -222,6 +250,7 @@ local UPGRADE_ORDER = {
 }
 
 local upgradeSelected = {}  -- [upgradeName] = bool — filled from LS below
+local _sacNameSelected = {} -- [weaponName] = bool — Sacrifice "By Name" picks (persisted)
 
 local walkSpeedVal   = 16
 -- BIG-phase default: map-tuned — huge boxes add overlap pairs and tank KPM vs ~500 (Test 8b ~5.5x).
@@ -242,6 +271,12 @@ local function saveSettings()
         end
         t.upgradeSelected = up
         t.hitboxSize = hitboxSize
+        local sacNames = {}
+        for name, on in pairs(_sacNameSelected) do
+            if on then sacNames[#sacNames + 1] = name end
+        end
+        table.sort(sacNames)
+        t.sacNamesSelected = sacNames
         writefile(SETTINGS_FILE, HttpService:JSONEncode(t))
     end)
 end
@@ -281,8 +316,24 @@ if type(LS.upgradeSelected) == "table" then
         upgradeSelected[name] = (v == true or v == 1)
     end
 end
+if type(LS.sacNamesSelected) == "table" then
+    _sacNameSelected = {}
+    for _, n in ipairs(LS.sacNamesSelected) do
+        if type(n) == "string" then _sacNameSelected[n] = true end
+    end
+end
 states.autoUpgradeOn = states.autoUpgradeOn == true
 states.autoAscend    = states.autoAscend == true
+states.autoSacrifice = states.autoSacrifice == true
+if LS.sacFilterColor ~= nil then
+    states.sacFilterColor = LS.sacFilterColor == true
+elseif LS.sacFilterRarity ~= nil then
+    states.sacFilterColor = LS.sacFilterRarity == true
+end
+states.sacFilterColor = states.sacFilterColor == true
+states.sacFilterName  = states.sacFilterName == true
+states.sacRarityCapIdx = math.clamp(math.floor(tonumber(states.sacRarityCapIdx) or 1), 1, 9)
+states.sacKeepQty      = math.clamp(math.floor(tonumber(states.sacKeepQty) or 0), 0, 999)
 
 -- ============================================================
 --  BUILD WINDOW
@@ -306,7 +357,6 @@ local AreaTab = Win:Tab("🗺️",  "Areas")
 -- ============================================================
 local MiscTab = Win:Tab("⚙️",  "Misc")
 local UpgTab  = Win:Tab("⬆️",  "Auto Upgrade")
-Win:ChatTab()
 
 -- ── Colour theme ──────────────────────────────────────────────
 local C = {
@@ -514,6 +564,374 @@ addThread(task.spawn(function()
     end
 end))
 
+-- ============================================================
+--  SACRIFICE TAB — GetWeaponsInv / FountainSacrifice
+--  Rarity = weapon:GetAttribute("OneIn") on RS.Assets.Weapons (matches in-game colors)
+-- ============================================================
+local SacTab = Win:Tab("🕯️", "Sacrifice")
+
+-- OneIn max per tier (sacrifice weapons with OneIn ≤ cap for selected row)
+local SAC_TIERS = {
+    { emoji = "⬜", name = "Common",     maxOneIn = 5 },
+    { emoji = "🟩", name = "Uncommon",   maxOneIn = 50 },
+    { emoji = "🟦", name = "Rare",       maxOneIn = 200 },
+    { emoji = "🟣", name = "Epic",       maxOneIn = 5000 },
+    { emoji = "🟠", name = "Legendary",  maxOneIn = 50000 },
+    { emoji = "🩷", name = "Mythic",     maxOneIn = 1000000 },
+    { emoji = "🟤", name = "Galactic",   maxOneIn = 7000000 },
+    { emoji = "🩵", name = "Godly",      maxOneIn = 11000000 },
+    { emoji = "⬛", name = "Omnipotent", maxOneIn = 99000000 },
+}
+
+local _sacInv = {}
+local _sacAssetCache = {}
+
+local function sacWeaponsFolder()
+    local a = RS:FindFirstChild("Assets")
+    return a and a:FindFirstChild("Weapons")
+end
+
+local function sacLookupAsset(weaponName)
+    if _sacAssetCache[weaponName] ~= nil then
+        local c = _sacAssetCache[weaponName]
+        return c ~= false and c or nil
+    end
+    local folder = sacWeaponsFolder()
+    local asset = nil
+    if folder then
+        asset = folder:FindFirstChild(weaponName)
+        if not asset then
+            local nl = weaponName:lower()
+            for _, ch in ipairs(folder:GetChildren()) do
+                if ch.Name:lower() == nl then asset = ch; break end
+            end
+        end
+    end
+    _sacAssetCache[weaponName] = asset or false
+    return asset
+end
+
+local function sacTierFromOneIn(oneIn)
+    local o = tonumber(oneIn)
+    if not o then return "?", "?" end
+    for _, t in ipairs(SAC_TIERS) do
+        if o <= t.maxOneIn then
+            return t.emoji .. " " .. t.name, t
+        end
+    end
+    return "✴ Above Omnipotent", nil
+end
+
+local function sacCapOneInForDropdownIdx(idx)
+    local t = SAC_TIERS[math.clamp(math.floor(tonumber(idx) or 1), 1, #SAC_TIERS)]
+    return t and t.maxOneIn or 5
+end
+
+local function normSacWeapon(e)
+    if type(e) ~= "table" then return nil end
+    local name = e.Name or e.name or e.WepName or e.WeaponName or e.Weapon
+    if not name or name == "" then return nil end
+    local wtype = e.Type or e.WeaponType or e.type or e.Category or "Unknown"
+    return {
+        name   = tostring(name),
+        type   = tostring(wtype),
+        qty    = math.max(0, math.floor(tonumber(e.Quantity or e.Qty or e.Count or e.amount or e.Amount or 1) or 0)),
+        oneIn  = nil,
+        rank   = math.floor(tonumber(e.Rank or e.rank or e.Tier or 0) or 0),
+        damage = tonumber(e.Damage or e.damage or e.DPS or e.BaseDamage or 0) or 0,
+    }
+end
+
+local function sacEnrichFromAssets()
+    for _, w in ipairs(_sacInv) do
+        local asset = sacLookupAsset(w.name)
+        if asset then
+            w.oneIn = tonumber(asset:GetAttribute("OneIn"))
+            w.rank = math.floor(tonumber(asset:GetAttribute("Rank")) or w.rank or 0)
+            w.damage = tonumber(asset:GetAttribute("Damage")) or w.damage or 0
+        end
+        if w.oneIn == nil then
+            w.oneIn = math.huge
+        end
+    end
+end
+
+local SAC_DROPDOWN_LABELS = {}
+for i, t in ipairs(SAC_TIERS) do
+    SAC_DROPDOWN_LABELS[i] = string.format("%s %s · sacrifice if OneIn≤%s", t.emoji, t.name, tostring(t.maxOneIn))
+end
+
+local function sacAnyFilterOn()
+    return states.sacFilterColor or states.sacFilterName
+end
+
+local function sacWeaponPasses(w)
+    if states.sacFilterName then
+        return _sacNameSelected[w.name] == true
+    end
+    if states.sacFilterColor then
+        local cap = sacCapOneInForDropdownIdx(states.sacRarityCapIdx)
+        local oi = tonumber(w.oneIn)
+        if not oi or oi == math.huge then return false end
+        return oi <= cap
+    end
+    return false
+end
+
+SacTab:Section("Sacrifice")
+SacTab:Label("All options below save to meleernq_settings.json (with Auto Save on). Weapon name ticks save too.")
+SacTab:Label("Refresh ties each weapon to RS.Assets.Weapons for OneIn (color tier). Auto-refresh ~2s after load.")
+SacTab:Label("By color: OneIn ≤ dropdown cap. By Name: only ticked rows (ignores color). Keep qty always applies.")
+local sacStatusLbl = SacTab:Label("Auto: OFF · idle")
+local sacLastLbl   = SacTab:Label("Last: —")
+
+local sacInvLbl
+local sacWeaponScroll
+
+local function rebuildSacWeaponRows()
+    if not sacWeaponScroll then return end
+    for _, c in ipairs(sacWeaponScroll:GetChildren()) do
+        if c:IsA("TextButton") then c:Destroy() end
+    end
+    table.sort(_sacInv, function(a, b) return a.name:lower() < b.name:lower() end)
+    for i, w in ipairs(_sacInv) do
+        local row = Instance.new("TextButton", sacWeaponScroll)
+        row.Size = UDim2.new(1, -8, 0, 26)
+        row.LayoutOrder = i
+        row.BackgroundColor3 = _sacNameSelected[w.name] and Color3.fromRGB(0, 45, 25) or Color3.fromRGB(12, 16, 24)
+        row.BorderSizePixel = 0
+        row.Text = ""
+        Instance.new("UICorner", row).CornerRadius = UDim.new(0, 4)
+        local lbl = Instance.new("TextLabel", row)
+        lbl.Size = UDim2.new(1, -28, 1, 0)
+        lbl.Position = UDim2.new(0, 6, 0, 0)
+        lbl.BackgroundTransparency = 1
+        lbl.Font = Enum.Font.GothamBold
+        lbl.TextSize = 10
+        lbl.TextXAlignment = Enum.TextXAlignment.Left
+        lbl.TextTruncate = Enum.TextTruncate.AtEnd
+        lbl.TextColor3 = _sacNameSelected[w.name] and C.green or C.text
+        local tierLbl = select(1, sacTierFromOneIn(w.oneIn))
+        local oiDisp = (w.oneIn and w.oneIn < 1e15) and tostring(math.floor(w.oneIn)) or "?"
+        lbl.Text = string.format("%s  OneIn=%s  ×%d  R%d  dmg %.0f  %s", tierLbl, oiDisp, w.qty, w.rank, w.damage, w.name)
+        local chk = Instance.new("Frame", row)
+        chk.Size = UDim2.new(0, 14, 0, 14)
+        chk.Position = UDim2.new(1, -20, 0.5, -7)
+        chk.BackgroundColor3 = _sacNameSelected[w.name] and C.green or C.border
+        chk.BorderSizePixel = 0
+        Instance.new("UICorner", chk).CornerRadius = UDim.new(0, 3)
+        local tick = Instance.new("TextLabel", chk)
+        tick.Size = UDim2.new(1, 0, 1, 0)
+        tick.BackgroundTransparency = 1
+        tick.Text = "✓"
+        tick.TextColor3 = Color3.new(1, 1, 1)
+        tick.Font = Enum.Font.GothamBold
+        tick.TextSize = 9
+        tick.Visible = _sacNameSelected[w.name] == true
+        row.MouseButton1Click:Connect(function()
+            _sacNameSelected[w.name] = not _sacNameSelected[w.name]
+            rebuildSacWeaponRows()
+            saveSettings()
+        end)
+    end
+end
+
+local function refreshSacInventory()
+    _sacAssetCache = {}
+    local raw = invokeR("GetWeaponsInv")
+    _sacInv = {}
+    if type(raw) == "table" then
+        local function pushEntry(e)
+            local w = normSacWeapon(e)
+            if w and w.qty > 0 then _sacInv[#_sacInv + 1] = w end
+        end
+        if raw[1] ~= nil then
+            for _, e in ipairs(raw) do pushEntry(e) end
+        else
+            for _, e in pairs(raw) do pushEntry(e) end
+        end
+    end
+    sacEnrichFromAssets()
+    local totalQty = 0
+    for _, w in ipairs(_sacInv) do totalQty = totalQty + w.qty end
+    if sacInvLbl then
+        sacInvLbl.Set(string.format("Inv: %d types | %d total qty", #_sacInv, totalQty))
+    end
+    for _, w in ipairs(_sacInv) do
+        local tl = select(1, sacTierFromOneIn(w.oneIn))
+        local oi = (w.oneIn and w.oneIn < 1e15) and math.floor(w.oneIn) or -1
+        print(string.format("[MeleeRNG/Sac] [OK] %-32s x%-4d  Rank=%-3s  Dmg=%-8s  OneIn=%-10s  %s  | %s",
+            w.name, w.qty, tostring(w.rank), tostring(w.damage), oi >= 0 and tostring(oi) or "?", w.type, tl))
+    end
+    rebuildSacWeaponRows()
+    SLbl.Text = string.format("Sacrifice: %d weapon types (OneIn from Assets)", #_sacInv)
+end
+
+SacTab:Button("🔄", "Refresh Inventory", "GetWeaponsInv:InvokeServer() — list + console print", C.accent, function()
+    refreshSacInventory()
+end)
+
+sacInvLbl = SacTab:Label("Inv: 0 types | 0 total — tap Refresh")
+
+SacTab:Section("Filters (color + name only)")
+local sacFilterColorToggle = SacTab:Toggle("By color (OneIn)", "Sacrifice weapons with OneIn ≤ cap for tier below (from Assets) — saved", states.sacFilterColor, function(on)
+    states.sacFilterColor = on == true; saveSettings()
+end)
+local sacFilterNameToggle = SacTab:Toggle("By Name", "Only ticked rows in list — ignores color filter — saved", states.sacFilterName, function(on)
+    states.sacFilterName = on == true; saveSettings()
+end)
+
+local sacRarityDropdown = SacTab:Dropdown(
+    "Sacrifice up through this color",
+    "Max OneIn for that color band (saved). Weapons with OneIn ≤ that number match.",
+    SAC_DROPDOWN_LABELS,
+    math.clamp(states.sacRarityCapIdx, 1, #SAC_TIERS),
+    function(_, _, idx)
+        states.sacRarityCapIdx = math.clamp(math.floor(tonumber(idx) or 1), 1, #SAC_TIERS)
+        saveSettings()
+    end
+)
+
+SacTab:Label("Tier caps (OneIn): ⬜≤5 · 🟩≤50 · 🟦≤200 · 🟣≤5k · 🟠≤50k · 🩷≤1M · 🟤≤7M · 🩵≤11M · ⬛≤99M")
+
+SacTab:Section("Always keep")
+local sacKeepSlider = SacTab:Slider("Always keep qty", "Per weapon type: keep at least this many; sacrifice the rest (saved)", {
+    min = 0, max = 999, default = math.clamp(states.sacKeepQty, 0, 999),
+    format = function(v) return "keep " .. tostring(math.floor(v)) end,
+}, function(v)
+    states.sacKeepQty = math.floor(v); saveSettings()
+end)
+
+local sacAutoToggle = SacTab:Toggle("Toggle Auto Sacrifice", "Every 3s: inventory, filters, FountainSacrifice — saved", states.autoSacrifice, function(on)
+    states.autoSacrifice = on == true
+    saveSettings()
+    sacStatusLbl.Set(on and "Auto: ON · every 3s" or "Auto: OFF · idle")
+    SLbl.Text = on and "Auto Sacrifice ON" or "Auto Sacrifice OFF"
+end)
+
+SacTab:Section("By Name — tick rows")
+SacTab:Label("Selections are saved. Empty list until Refresh.")
+
+local function sacNextLayoutOrder()
+    local m = 0
+    for _, ch in ipairs(SacTab._page:GetChildren()) do
+        if ch:IsA("GuiObject") and ch.LayoutOrder > m then m = ch.LayoutOrder end
+    end
+    return m + 1
+end
+
+local sacListCard = Instance.new("Frame", SacTab._page)
+sacListCard.BackgroundColor3 = C.card
+sacListCard.BorderSizePixel = 0
+sacListCard.Size = UDim2.new(1, -10, 0, 0)
+sacListCard.AutomaticSize = Enum.AutomaticSize.Y
+sacListCard.LayoutOrder = sacNextLayoutOrder()
+Instance.new("UICorner", sacListCard).CornerRadius = UDim.new(0, 10)
+Instance.new("UIStroke", sacListCard).Color = C.border
+local sacCardPad = Instance.new("UIPadding", sacListCard)
+sacCardPad.PaddingBottom = UDim.new(0, 8)
+
+sacWeaponScroll = Instance.new("ScrollingFrame", sacListCard)
+sacWeaponScroll.BackgroundColor3 = Color3.fromRGB(12, 16, 24)
+sacWeaponScroll.Size = UDim2.new(1, -16, 0, 140)
+sacWeaponScroll.Position = UDim2.new(0, 8, 0, 8)
+sacWeaponScroll.BorderSizePixel = 0
+sacWeaponScroll.ScrollBarThickness = 3
+sacWeaponScroll.ScrollBarImageColor3 = C.accent
+sacWeaponScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+sacWeaponScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+Instance.new("UICorner", sacWeaponScroll).CornerRadius = UDim.new(0, 6)
+local sacListLayout = Instance.new("UIListLayout", sacWeaponScroll)
+sacListLayout.Padding = UDim.new(0, 2)
+sacListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+sacListLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+    local inner = math.min(sacListLayout.AbsoluteContentSize.Y + 6, 240)
+    sacWeaponScroll.Size = UDim2.new(1, -16, 0, math.max(120, inner))
+end)
+
+task.defer(function()
+    pcall(function()
+        if sacFilterColorToggle and sacFilterColorToggle.Set then
+            sacFilterColorToggle.Set(states.sacFilterColor)
+        end
+        if sacFilterNameToggle and sacFilterNameToggle.Set then
+            sacFilterNameToggle.Set(states.sacFilterName)
+        end
+        if sacRarityDropdown and sacRarityDropdown.Set then
+            sacRarityDropdown.Set(states.sacRarityCapIdx)
+        end
+        if sacKeepSlider and sacKeepSlider.Set then
+            sacKeepSlider.Set(math.clamp(states.sacKeepQty, 0, 999), true)
+        end
+        if sacAutoToggle and sacAutoToggle.Set then
+            sacAutoToggle.Set(states.autoSacrifice)
+        end
+        sacStatusLbl.Set(states.autoSacrifice and "Auto: ON · every 3s" or "Auto: OFF · idle")
+    end)
+end)
+
+task.defer(function()
+    task.wait(2)
+    if GEN ~= _G.MeleeRNG_Gen then return end
+    pcall(refreshSacInventory)
+end)
+
+addThread(task.spawn(function()
+    while true do
+        if GEN ~= _G.MeleeRNG_Gen then break end
+        if not states.autoSacrifice then task.wait(1); continue end
+        task.wait(3)
+        if not sacAnyFilterOn() then
+            sacStatusLbl.Set("Auto: ON — enable ≥1 filter")
+            continue
+        end
+        local sacrificed, skipped = 0, 0
+        pcall(function()
+            _sacAssetCache = {}
+            local raw = invokeR("GetWeaponsInv")
+            _sacInv = {}
+            if type(raw) == "table" then
+                local function pushEntry(e)
+                    local w = normSacWeapon(e)
+                    if w and w.qty > 0 then _sacInv[#_sacInv + 1] = w end
+                end
+                if raw[1] ~= nil then
+                    for _, e in ipairs(raw) do pushEntry(e) end
+                else
+                    for _, e in pairs(raw) do pushEntry(e) end
+                end
+            end
+            sacEnrichFromAssets()
+            rebuildSacWeaponRows()
+            local totalQty = 0
+            for _, w in ipairs(_sacInv) do totalQty = totalQty + w.qty end
+            sacInvLbl.Set(string.format("Inv: %d types | %d total qty", #_sacInv, totalQty))
+
+            local keep = math.max(0, math.floor(tonumber(states.sacKeepQty) or 0))
+            for _, w in ipairs(_sacInv) do
+                if sacWeaponPasses(w) then
+                    local toSac = math.max(0, w.qty - keep)
+                    if toSac > 0 then
+                        local res = invokeR("FountainSacrifice", w.name, w.type, toSac)
+                        if res == false then
+                            skipped = skipped + 1
+                        else
+                            sacrificed = sacrificed + 1
+                            sacLastLbl.Set("Last: " .. w.name .. " ×" .. tostring(toSac))
+                        end
+                    else
+                        skipped = skipped + 1
+                    end
+                else
+                    skipped = skipped + 1
+                end
+            end
+        end)
+        sacStatusLbl.Set(string.format("Auto: ON · sacrificed %d types · skipped %d · next 3s", sacrificed, skipped))
+    end
+end))
+
+Win:ChatTab()
 
 -- ============================================================
 -- Cache hitbox parts so we don't scan descendants every frame
@@ -981,9 +1399,18 @@ task.defer(function()
         end
     end)
 end)
-MiscTab:Button("⬆️", "Ascend Now", "Manually calls ConfirmAscend:InvokeServer()", C.gold, function()
+MiscTab:Button("⬆️", "Ascend Now", "ConfirmAscend — then TP only if Ascends stat increases", C.gold, function()
+    local beforeA = tonumber(getAscends()) or 0
     local ok = invokeR("ConfirmAscend")
-    SLbl.Text = ok and "✓ Ascended!" or "⚠ Not ready (kill requirement not met)"
+    if not ok then
+        SLbl.Text = "⚠ Not ready (kill requirement not met)"
+        return
+    end
+    if teleportAfterAscendIfConfirmed(beforeA) then
+        SLbl.Text = "✓ Ascended — TP X=496.9 Y=222.1 Z=-7380.4"
+    else
+        SLbl.Text = "⚠ Ascends unchanged — no TP (server did not apply ascend?)"
+    end
 end)
 MiscTab:Button("🎯", "Check Ascend Status", "Shows (2+Ascends)×1M kill gate vs your kills + next portal", C.accent, function()
     local req = getAscendKillsRequired()
@@ -1285,17 +1712,11 @@ addThread(task.spawn(function()
             local area = invokeR("GetArea"); if not area then return end
             local nextPortal = area:FindFirstChild("NextPortal"); if not nextPortal then return end
             local dest = nextPortal:GetAttribute("Destination")
-            local nextArea = dest and workspace.Areas and workspace.Areas:FindFirstChild(dest) or nil
+            local beforeA = tonumber(getAscends()) or 0
             local ok = invokeR("ConfirmAscend")
-            if ok then
-                SLbl.Text = "✓ Ascended! → " .. tostring(dest or "?")
-                local root = getRoot()
-                if root and nextArea then
-                    local spawn = nextArea:FindFirstChild("SafeAreaSpawn")
-                    if spawn then
-                        pcall(function() root.CFrame = spawn.CFrame * CFrame.new(0,3,0) end)
-                    end
-                end
+            if not ok then return end
+            if teleportAfterAscendIfConfirmed(beforeA) then
+                SLbl.Text = "✓ Ascended → " .. tostring(dest or "?") .. " | TP set pos"
             end
         end)
         task.wait(5)
@@ -1429,7 +1850,11 @@ MiscTab:Toggle("💾 Auto Save", "Automatically saves all toggle/slider states t
     SLbl.Text = on and "✓ Auto Save ON — settings saved on every change" or "Auto Save OFF"
 end)
 MiscTab:Button("🛑", "Stop All Loops", "Disconnects all connections and cancels all threads", C.red, function()
-    states.autoAscend = false
+    states.autoAscend  = false
+    states.autoSacrifice = false
+    pcall(function()
+        if sacAutoToggle and sacAutoToggle.Set then sacAutoToggle.Set(false) end
+    end)
     states.noclip    = false; states.godMode   = false
     states.fly       = false; states.antiAfk   = false
     states.fullBright= false; states.espMobs   = false
