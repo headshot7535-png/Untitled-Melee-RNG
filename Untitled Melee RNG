@@ -747,7 +747,7 @@ MoveTab:Toggle("🦅 Fly", "WASD + E/Q to go up/down", states.fly, function(on)
         if flyBG then flyBG:Destroy(); flyBG = nil end
     end
 end)
-MoveTab:Toggle("⏱️ Anti AFK", "Prevents auto-kick", states.antiAfk, function(on)
+MoveTab:Toggle("⏱️ Anti AFK", "Every 60s: synthetic left click via VirtualInputManager (InputBegan) so the game’s AFK timer resets; falls back to VirtualUser:ClickButton1", states.antiAfk, function(on)
     states.antiAfk = on; saveSettings()
 end)
 MoveTab:Toggle("💡 Full Bright", "Max ambient light, remove fog", states.fullBright, function(on)
@@ -1146,12 +1146,35 @@ addConn(RunService.Heartbeat:Connect(function()
 end))
 
 -- ── Anti AFK ─────────────────────────────────────────────────
+-- Game AFK uses InputBegan (e.g. u5 = tick()); VirtualUser:ClickButton2 is camera-side and skips that path.
+-- VirtualInputManager:SendMouseButtonEvent fires a real LMB press → InputBegan. Interval 60s ≪ 840s kick.
+local function sendAntiAfkInput()
+    local vx, vy = 1, 1
+    local cam = workspace.CurrentCamera
+    if cam then
+        local vs = cam.ViewportSize
+        vx = math.max(0, math.floor(vs.X * 0.5))
+        vy = math.max(0, math.floor(vs.Y * 0.5))
+    end
+    local okVim = pcall(function()
+        local vim = game:GetService("VirtualInputManager")
+        vim:SendMouseButtonEvent(vx, vy, 0, true)  -- 0 = left, down
+        task.wait()
+        vim:SendMouseButtonEvent(vx, vy, 0, false)
+    end)
+    if okVim then return end
+    pcall(function()
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton1(Vector2.new(vx, vy))
+    end)
+end
+
 addThread(task.spawn(function()
     while true do
         if GEN ~= _G.MeleeRNG_Gen then break end
-        task.wait(55)
+        task.wait(60)
         if states.antiAfk then
-            pcall(function() VirtualUser:CaptureController(); VirtualUser:ClickButton2(Vector2.new()) end)
+            sendAntiAfkInput()
         end
     end
 end))
