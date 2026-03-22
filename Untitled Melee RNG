@@ -767,7 +767,7 @@ end)
 MoveTab:Button("🔄", "Respawn", "Kills character", C.red, function()
     local h = getHuman(); if h then h.Health = 0 end
 end)
-MoveTab:Button("🌀", "Fire Nearest Machine", "Teleports to & fires nearest workspace.Machines ProximityPrompt", C.green, function()
+MoveTab:Button("🌀", "Fire Nearest Machine", "Fires nearest workspace.Machines ProximityPrompt (no teleport — executor fireproximityprompt)", C.green, function()
     local root = getRoot(); if not root then SLbl.Text = "No character"; return end
     local machines = workspace:FindFirstChild("Machines")
     if not machines then SLbl.Text = "⚠ workspace.Machines not found"; return end
@@ -943,27 +943,19 @@ MiscTab:Toggle("🙈 Show HideMobs Button", "Keeps HideMobsBtn visible — saved
 end)
 
 MiscTab:Section("Machines (workspace.Machines)")
-MiscTab:Label("Teleport to each machine and fire its ProximityPrompt.")
+MiscTab:Label("Open via ProximityPrompt only — no teleport (needs executor fireproximityprompt).")
 
 local MACHINE_NAMES = {"Fountain Of Skill", "Fusion Machine", "Totem Of Fortune", "Weapon Crafter"}
 for _, mname in ipairs(MACHINE_NAMES) do
     local mn = mname
-    MiscTab:Button("🔧", mn, "TP to " .. mn .. " and fire its ProximityPrompt", C.accent, function()
-        local root = getRoot(); if not root then SLbl.Text = "No character"; return end
+    MiscTab:Button("🔧", mn, "Fire " .. mn .. " ProximityPrompt from range (no TP)", C.accent, function()
         local machines = workspace:FindFirstChild("Machines")
         local machine  = machines and machines:FindFirstChild(mn)
         if not machine then SLbl.Text = "⚠ " .. mn .. " not found in workspace.Machines"; return end
-        -- Teleport next to it
-        local ok, bb = pcall(function() return machine:GetBoundingBox() end)
-        if ok then
-            root.CFrame = CFrame.new(bb.Position + Vector3.new(0, 5, 0))
-            task.wait(0.3)
-        end
-        -- Fire the ProximityPrompt (direct child confirmed from explorer)
         local prompt = machine:FindFirstChild("ProximityPrompt")
         if prompt then
-            pcall(function() fireproximityprompt(prompt) end)
-            SLbl.Text = "✓ Fired: " .. mn
+            local ok = pcall(function() fireproximityprompt(prompt) end)
+            SLbl.Text = ok and ("✓ Opened: " .. mn) or ("⚠ fireproximityprompt failed — " .. mn)
         else
             SLbl.Text = "⚠ No ProximityPrompt on " .. mn
         end
