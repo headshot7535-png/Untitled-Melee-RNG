@@ -95,6 +95,10 @@ local function getKills()   return getCachedStat("Kills") end
 local function getMana()    return getCachedStat("Mana") end
 local function getSP()      return getCachedStat("SP") end
 local function getAscends() return getCachedStat("Ascends") end
+-- Ascend kill gate (AscendUIController): "2 + v8 .. M Kills" where v8 = current ascend count — not area MinimumKills
+local function getAscendKillsRequired()
+    return (2 + (tonumber(getAscends()) or 0)) * 1000000
+end
 
 -- ── Remote cache ─────────────────────────────────────────────
 local _remotes = {}
@@ -278,6 +282,7 @@ if type(LS.upgradeSelected) == "table" then
     end
 end
 states.autoUpgradeOn = states.autoUpgradeOn == true
+states.autoAscend    = states.autoAscend == true
 
 -- ============================================================
 --  BUILD WINDOW
@@ -963,27 +968,38 @@ for _, mname in ipairs(MACHINE_NAMES) do
 end
 
 MiscTab:Section("Ascend")
-MiscTab:Toggle("⬆️ Auto Ascend", "Ascends automatically when kill requirement is met", states.autoAscend, function(on)
-    states.autoAscend = on; saveSettings()
-    SLbl.Text = on and "Auto Ascend ON" or "Auto Ascend OFF"
+local autoAscendToggle = MiscTab:Toggle("⬆️ Auto Ascend", "When kills ≥ (2 + your Ascends) × 1M — saved to meleernq_settings.json", states.autoAscend, function(on)
+    states.autoAscend = on == true
+    saveSettings()
+    SLbl.Text = states.autoAscend and "Auto Ascend ON" or "Auto Ascend OFF"
+end)
+
+task.defer(function()
+    pcall(function()
+        if autoAscendToggle and autoAscendToggle.Set then
+            autoAscendToggle.Set(states.autoAscend)
+        end
+    end)
 end)
 MiscTab:Button("⬆️", "Ascend Now", "Manually calls ConfirmAscend:InvokeServer()", C.gold, function()
     local ok = invokeR("ConfirmAscend")
     SLbl.Text = ok and "✓ Ascended!" or "⚠ Not ready (kill requirement not met)"
 end)
-MiscTab:Button("🎯", "Check Ascend Status", "Shows kills needed for next area", C.accent, function()
-    local area = invokeR("GetArea")
-    if not area then SLbl.Text = "⚠ GetArea returned nil"; return end
-    local np = area:FindFirstChild("NextPortal")
-    if not np then SLbl.Text = "No NextPortal found"; return end
-    local dest = np:GetAttribute("Destination")
-    if not dest then SLbl.Text = "No Destination on NextPortal"; return end
-    local nextArea = workspace:FindFirstChild("Areas") and workspace.Areas:FindFirstChild(dest)
-    if not nextArea then SLbl.Text = "Area not found: " .. tostring(dest); return end
-    local minK = tonumber(nextArea:GetAttribute("MinimumKills")) or 0
-    local minA = tonumber(nextArea:GetAttribute("MinAscends")) or 0
-    local have = getKills()
-    SLbl.Text = string.format("-> %s | Need %d kills (%d more) | %d ascends req", dest, minK, math.max(0,minK-have), minA)
+MiscTab:Button("🎯", "Check Ascend Status", "Shows (2+Ascends)×1M kill gate vs your kills + next portal", C.accent, function()
+    local req = getAscendKillsRequired()
+    local have = tonumber(getKills()) or 0
+    local more = math.max(0, req - have)
+    local dest = nil
+    pcall(function()
+        local area = invokeR("GetArea")
+        if not area then return end
+        local np = area:FindFirstChild("NextPortal")
+        if not np then return end
+        dest = np:GetAttribute("Destination")
+    end)
+    SLbl.Text = string.format(
+        "Ascend: %s / %s kills (%s more) | ascends=%s | next → %s",
+        tostring(have), tostring(req), tostring(more), tostring(getAscends()), tostring(dest or "?"))
 end)
 
 MiscTab:Section("Upgrades")
@@ -1258,30 +1274,26 @@ end))
 
 -- ============================================================
 -- ── Auto Ascend Loop ──────────────────────────────────────────
--- ConfirmAscend:InvokeServer() — from AscendUIController
+-- ConfirmAscend:InvokeServer() — kill gate is (2 + ascends)×1M (AscendUIController), not area MinimumKills
 addThread(task.spawn(function()
     while true do
         if GEN ~= _G.MeleeRNG_Gen then break end
         if not states.autoAscend then task.wait(2); continue end
         pcall(function()
+            local need = getAscendKillsRequired()
+            if (tonumber(getKills()) or 0) < need then return end
             local area = invokeR("GetArea"); if not area then return end
             local nextPortal = area:FindFirstChild("NextPortal"); if not nextPortal then return end
-            local dest = nextPortal:GetAttribute("Destination"); if not dest then return end
-            local nextArea = workspace.Areas and workspace.Areas:FindFirstChild(dest)
-            if not nextArea then return end
-            local minK = tonumber(nextArea:GetAttribute("MinimumKills")) or math.huge
-            local minA = tonumber(nextArea:GetAttribute("MinAscends"))  or 0
-            if getKills() >= minK and getAscends() >= minA then
-                local ok = invokeR("ConfirmAscend")
-                if ok then
-                    SLbl.Text = "✓ Ascended! → " .. dest
-                    -- Teleport to new area
-                    local root = getRoot()
-                    if root then
-                        local spawn = nextArea:FindFirstChild("SafeAreaSpawn")
-                        if spawn then
-                            pcall(function() root.CFrame = spawn.CFrame * CFrame.new(0,3,0) end)
-                        end
+            local dest = nextPortal:GetAttribute("Destination")
+            local nextArea = dest and workspace.Areas and workspace.Areas:FindFirstChild(dest) or nil
+            local ok = invokeR("ConfirmAscend")
+            if ok then
+                SLbl.Text = "✓ Ascended! → " .. tostring(dest or "?")
+                local root = getRoot()
+                if root and nextArea then
+                    local spawn = nextArea:FindFirstChild("SafeAreaSpawn")
+                    if spawn then
+                        pcall(function() root.CFrame = spawn.CFrame * CFrame.new(0,3,0) end)
                     end
                 end
             end
@@ -1343,15 +1355,17 @@ local function fmtTime(secs)
     return string.format("%ds",s)
 end
 
+-- next portal name (or nil), kills short of req, total kills required = (2+ascends)×1M
 local function getAscendETA()
-    local area = invokeR("GetArea"); if not area then return nil,nil,nil end
-    local np = area:FindFirstChild("NextPortal"); if not np then return nil,nil,nil end
-    local dest = np:GetAttribute("Destination"); if not dest then return nil,nil,nil end
-    local nextArea = workspace:FindFirstChild("Areas") and workspace.Areas:FindFirstChild(dest)
-    if not nextArea then return nil,nil,nil end
-    local minK = tonumber(nextArea:GetAttribute("MinimumKills")) or 0
-    local minA = tonumber(nextArea:GetAttribute("MinAscends"))  or 0
-    return dest, math.max(0, minK-getKills()), math.max(0, minA-getAscends())
+    local req = getAscendKillsRequired()
+    local killsNeeded = math.max(0, req - (tonumber(getKills()) or 0))
+    local dest
+    pcall(function()
+        local area = invokeR("GetArea"); if not area then return end
+        local np = area:FindFirstChild("NextPortal"); if not np then return end
+        dest = np:GetAttribute("Destination")
+    end)
+    return dest, killsNeeded, req
 end
 
 addThread(task.spawn(function()
@@ -1364,8 +1378,8 @@ end))
 
 MiscTab:Section("Stats & Kill Rate")
 local StatsLbl = MiscTab:Label("Kills: — | Mana: — | SP: — | Ascends: —")
-local KPMLbl   = MiscTab:Label("KPM: — | ETA to next area: —")
-local ETALbl   = MiscTab:Label("Next area: — | Need: — kills")
+local KPMLbl   = MiscTab:Label("KPM: — | ETA ascend: —")
+local ETALbl   = MiscTab:Label("Ascend: — / — kills —")
 
 addThread(task.spawn(function()
     while true do
@@ -1375,17 +1389,17 @@ addThread(task.spawn(function()
         pcall(function()
             StatsLbl.Set(string.format("Kills: %s | Mana: %s | SP: %s | Ascends: %s",
                 tostring(getKills()), tostring(getMana()), tostring(getSP()), tostring(getAscends())))
-            local dest, killsNeeded, ascendsNeeded = getAscendETA()
-            if dest then
+            local dest, killsNeeded, req = getAscendETA()
+            if req then
                 local etaSecs = (kpm>0 and killsNeeded>0) and (killsNeeded/kpm*60) or nil
                 local etaStr  = etaSecs and fmtTime(etaSecs) or (killsNeeded==0 and "READY" or "—")
-                KPMLbl.Set(string.format("KPM: %.1f | ETA %s: %s", kpm, dest, etaStr))
-                ETALbl.Set(string.format("Need: %s kills%s | Have: %s",
-                    tostring(killsNeeded),
-                    ascendsNeeded>0 and (" + "..ascendsNeeded.." ascends") or "",
-                    tostring(getKills())))
+                local destStr = dest and tostring(dest) or "?"
+                KPMLbl.Set(string.format("KPM: %.1f | ETA ascend → %s: %s", kpm, destStr, etaStr))
+                ETALbl.Set(string.format("Ascend: %s / %s kills (%s more) → %s",
+                    tostring(getKills()), tostring(req), tostring(killsNeeded), destStr))
             else
-                KPMLbl.Set(string.format("KPM: %.1f | Area data loading...", kpm))
+                KPMLbl.Set(string.format("KPM: %.1f | Ascend: —", kpm))
+                ETALbl.Set("Ascend: —")
             end
         end)
     end
