@@ -207,7 +207,17 @@ local states = {
     autoReExec     = false,
     hitboxPulse    = false,
     hitboxDutyCycle  = 2,  -- BIG on 1 frame per N heartbeats (2 = half the frames big, old behavior; 6+ = mostly tiny, less physics lag)
+    autoUpgradeOn  = false,  -- master Auto Upgrade loop (saved with other toggles)
 }
+
+-- Upgrade names for save/load (must exist before saveSettings references upgradeSelected)
+local UPGRADE_ORDER = {
+    "Weapons Equipped", "Damage Multiplier", "Enemy Spawn Rate", "Enemy Limit",
+    "Mana Multiplier", "Spin Speed", "RNG Luck", "Kill Multiplier",
+    "Skill Point Multiplier", "Boss Spawn Chance",
+}
+
+local upgradeSelected = {}  -- [upgradeName] = bool — filled from LS below
 
 local walkSpeedVal   = 16
 -- BIG-phase default: map-tuned — huge boxes add overlap pairs and tank KPM vs ~500 (Test 8b ~5.5x).
@@ -222,7 +232,11 @@ local function saveSettings()
         local t = {}
         for k, v in pairs(states) do t[k] = v end
         t.walkSpeedVal = walkSpeedVal
-        t.upgradeSelected = upgradeSelected
+        local up = {}
+        for _, name in ipairs(UPGRADE_ORDER) do
+            up[name] = upgradeSelected[name] == true
+        end
+        t.upgradeSelected = up
         t.hitboxSize = hitboxSize
         writefile(SETTINGS_FILE, HttpService:JSONEncode(t))
     end)
@@ -257,6 +271,13 @@ if LS.hitboxSize ~= nil then
         hitboxSize = n
     end
 end
+if type(LS.upgradeSelected) == "table" then
+    for _, name in ipairs(UPGRADE_ORDER) do
+        local v = LS.upgradeSelected[name]
+        upgradeSelected[name] = (v == true or v == 1)
+    end
+end
+states.autoUpgradeOn = states.autoUpgradeOn == true
 
 -- ============================================================
 --  BUILD WINDOW
@@ -356,36 +377,19 @@ local UPGRADE_PRICES = {
     ["Boss Spawn Chance"]      = function(p) return math.round(p^4) + 150 end,
 }
 
-local UPGRADE_ORDER = {
-    "Weapons Equipped", "Damage Multiplier", "Enemy Spawn Rate", "Enemy Limit",
-    "Mana Multiplier", "Spin Speed", "RNG Luck", "Kill Multiplier",
-    "Skill Point Multiplier", "Boss Spawn Chance",
-}
-
--- Which upgrades the player has selected for auto-buy
-local upgradeSelected = {}
--- Load from save
-pcall(function()
-    if isfile and isfile(SETTINGS_FILE) then
-        local ok, d = pcall(function() return HttpService:JSONDecode(readfile(SETTINGS_FILE)) end)
-        if ok and type(d) == "table" and type(d.upgradeSelected) == "table" then
-            upgradeSelected = d.upgradeSelected
-        end
-    end
-end)
-
-local autoUpgradeActive = false
 local upgStatusLbl  = UpgTab:Label("Status: OFF")
 local upgInfoLbl    = UpgTab:Label("SP: — | Next: —")
 
 local function setAutoUpgrade(on)
-    autoUpgradeActive = on
+    states.autoUpgradeOn = on == true
     upgStatusLbl.Set(on and "Status: ON - Watching SP..." or "Status: OFF")
 end
 
-UpgTab:Button("⚡", "Toggle Auto Upgrade", "Start/stop the auto upgrade loop", C.gold, function()
-    autoUpgradeActive = not autoUpgradeActive
-    setAutoUpgrade(autoUpgradeActive)
+setAutoUpgrade(states.autoUpgradeOn)
+
+UpgTab:Button("⚡", "Toggle Auto Upgrade", "Start/stop the auto upgrade loop (saved)", C.gold, function()
+    setAutoUpgrade(not states.autoUpgradeOn)
+    saveSettings()
 end)
 
 UpgTab:Label("Buys checked upgrades when SP is sufficient. Price from SharedConstants.Upgrades.")
@@ -426,7 +430,7 @@ addThread(task.spawn(function()
     task.wait(2)  -- wait for game to load
     while true do
         if GEN ~= _G.MeleeRNG_Gen then break end
-        if not autoUpgradeActive then task.wait(2); continue end
+        if not states.autoUpgradeOn then task.wait(2); continue end
         local sp = getSP()
         local nextName, nextPrice = "none", math.huge
         for _, name in ipairs(UPGRADE_ORDER) do
@@ -451,7 +455,7 @@ addThread(task.spawn(function()
     while true do
         if GEN ~= _G.MeleeRNG_Gen then break end
         task.wait(1)
-        if not autoUpgradeActive then continue end
+        if not states.autoUpgradeOn then continue end
 
         local sp = getSP()
         local bought = false
