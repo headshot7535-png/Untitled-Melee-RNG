@@ -1,7 +1,8 @@
 
 
+-- Preset buttons need Slider:Set — use local "NexusLib.lua" (patched copy next to this script) or update the GitHub Nexuslib repo to match Downloads NexusLib.lua
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
--- Full script URL (Auto Re-Execute: executor queue_on_teleport — 
+-- Full script URL (Auto Re-Execute: executor queue_on_teleport — same idea as ANIPIXELS GUI v5.0)
 local SCRIPT_URL     = "https://raw.githubusercontent.com/headshot7535-png/Untitled-Melee-RNG/main/Untitled%20Melee%20RNG"
 
 -- ── Load NexusLib ─────────────────────────────────────────────
@@ -292,6 +293,8 @@ local states = {
     showHideMobs   = false,
     autoReExec     = false,
     hitboxPulse    = false,
+    hitmobFireStride = 2,  -- Fire HitMob batch every Nth big pulse (1=all; higher = less lag)
+    hitboxDutyCycle  = 2,  -- BIG on 1 frame per N heartbeats (2 = half the frames big, old behavior; 6+ = mostly tiny, less physics lag)
 }
 
 local walkSpeedVal   = 16
@@ -582,17 +585,6 @@ end))
 
 
 -- ============================================================
-MoveTab:Section("Hitbox Pulse (Kill Exploit)")
-MoveTab:Label("Touched fires on SIZE CHANGE not static overlap. Static expand does nothing. Pulse oscillates big/tiny every tick — fires Touched on all mobs continuously.")
-
-MoveTab:Slider("Hitbox Size", "Studs radius for the big phase — larger = more mobs hit",
-    {min=10, max=100000, default=hitboxSize,
-     format=function(v) return math.floor(v).." studs" end},
-    function(v)
-        hitboxSize = math.floor(v)
-        saveSettings()
-    end)
-
 -- Cache hitbox parts so we don't scan descendants every frame
 -- ── Hitbox pulse variables ────────────────────────────────────────────────
 local farmDmgBase     = 9999  -- damage per hit sent with direct HitMob batch
@@ -604,6 +596,131 @@ local _pulseActive    = false
 local _pulsePhase     = false
 local _hitboxCache    = {}
 local _hitboxCacheDirty = true
+-- Reused every pulse (avoids Vector3.new + table churn)
+local _pulseBigVec    = Vector3.new(hitboxSize, hitboxSize, hitboxSize)
+local _cachedMobsFolder = nil
+-- Each entry: { m = Model, id = cached ID (nil until first resolve) } — no per-mob signals (scales to huge mob counts)
+local _mobEntries       = {}
+local _mobFolderConns   = nil
+local _batchRows        = {}
+local _scratchFireBatch = {}
+local HITMOB_STRIDE_MAX  = 16
+local HITBOX_DUTY_MAX    = 12
+
+local function registerMobModel(ch)
+    if not ch:IsA("Model") then return end
+    _mobEntries[#_mobEntries + 1] = { m = ch, id = ch:GetAttribute("ID") }
+end
+
+local function tearDownMobPulseCache()
+    if _mobFolderConns then
+        for _, c in ipairs(_mobFolderConns) do
+            pcall(function() c:Disconnect() end)
+        end
+        _mobFolderConns = nil
+    end
+    table.clear(_mobEntries)
+    _cachedMobsFolder = nil
+end
+
+local function setupMobPulseCache()
+    tearDownMobPulseCache()
+    local folder = workspace:FindFirstChild("Mobs")
+    if not folder then return end
+    _cachedMobsFolder = folder
+    _mobFolderConns = {}
+    for _, ch in ipairs(folder:GetChildren()) do
+        registerMobModel(ch)
+    end
+    _mobFolderConns[#_mobFolderConns + 1] = folder.ChildAdded:Connect(function(ch)
+        registerMobModel(ch)
+    end)
+    _mobFolderConns[#_mobFolderConns + 1] = folder.ChildRemoved:Connect(function(ch)
+        for i = #_mobEntries, 1, -1 do
+            if _mobEntries[i].m == ch then
+                table.remove(_mobEntries, i)
+                break
+            end
+        end
+    end)
+end
+
+local function compactMobPulseCache()
+    for i = #_mobEntries, 1, -1 do
+        local e = _mobEntries[i]
+        if not e.m.Parent then
+            table.remove(_mobEntries, i)
+        elseif e.id == nil then
+            e.id = e.m:GetAttribute("ID")
+        end
+    end
+end
+
+MoveTab:Section("Hitbox Pulse (Kill Exploit)")
+MoveTab:Label("Notes (sliders below):")
+MoveTab:Label("• Big phase duty — Hitbox goes huge only 1 frame out of every N. Higher N = you stay tiny longer = less lag. 2 ≈ old half-and-half.")
+MoveTab:Label("• Hitbox size — How large that huge flash is. Bigger hits more around you but costs more FPS when it flashes.")
+MoveTab:Label("• HitMob stride — How often the script fires the HitMob remote. Higher N = fewer server calls = less lag. Kills still mostly come from touch when size changes.")
+MoveTab:Label("Tip: If laggy, raise duty first, then stride. Turn pulse off when you do not need it.")
+
+local hitboxDutySlider, hitboxRadiusSlider, hitmobStrideSlider
+
+hitboxDutySlider = MoveTab:Slider("Big phase duty (1 / N frames)", "2 = big half the time (classic). 4–8 = one big flash per N frames (mostly tiny = way less physics lag).",
+    {min=2, max=HITBOX_DUTY_MAX, default=math.clamp(math.floor(tonumber(states.hitboxDutyCycle) or 2), 2, HITBOX_DUTY_MAX),
+     format=function(v) return "1 big / "..tostring(math.floor(v)) end},
+    function(v)
+        states.hitboxDutyCycle = math.clamp(math.floor(v), 2, HITBOX_DUTY_MAX)
+        saveSettings()
+    end)
+
+hitboxRadiusSlider = MoveTab:Slider("Hitbox Size", "Studs radius for the big phase — larger = more mobs hit",
+    {min=10, max=100000, default=hitboxSize,
+     format=function(v) return math.floor(v).." studs" end},
+    function(v)
+        hitboxSize = math.floor(v)
+        _pulseBigVec = Vector3.new(hitboxSize, hitboxSize, hitboxSize)
+        saveSettings()
+    end)
+
+hitmobStrideSlider = MoveTab:Slider("HitMob batch stride", "1 = every big duty frame. Higher = fewer FireServer calls (try 8–16 with duty 6+)",
+    {min=1, max=HITMOB_STRIDE_MAX, default=math.clamp(math.floor(tonumber(states.hitmobFireStride) or 2), 1, HITMOB_STRIDE_MAX),
+     format=function(v) return v == 1 and "every pulse" or ("1/"..tostring(math.floor(v))) end},
+    function(v)
+        states.hitmobFireStride = math.clamp(math.floor(v), 1, HITMOB_STRIDE_MAX)
+        saveSettings()
+    end)
+
+local function applyHitboxPulsePreset(title, duty, radius, stride)
+    local d = math.clamp(math.floor(duty), 2, HITBOX_DUTY_MAX)
+    local r = math.clamp(math.floor(radius), 10, 100000)
+    local s = math.clamp(math.floor(stride), 1, HITMOB_STRIDE_MAX)
+    -- NexusLib Slider must expose :Set (patched NexusLib). Old lib only updates saved values, not knob positions.
+    if hitboxDutySlider and type(hitboxDutySlider.Set) == "function"
+        and hitboxRadiusSlider and type(hitboxRadiusSlider.Set) == "function"
+        and hitmobStrideSlider and type(hitmobStrideSlider.Set) == "function" then
+        hitboxDutySlider.Set(d)
+        hitboxRadiusSlider.Set(r)
+        hitmobStrideSlider.Set(s)
+    else
+        states.hitboxDutyCycle = d
+        states.hitmobFireStride = s
+        hitboxSize = r
+        _pulseBigVec = Vector3.new(r, r, r)
+        saveSettings()
+    end
+    SLbl.Text = "⚡ Preset: " .. title
+end
+
+MoveTab:Label("Presets (tap to set all three sliders + save):")
+MoveTab:Button("⚡", "Fastest kills + range", "Duty 2 · 100,000 studs · HitMob stride 1 (max power, most lag)", C.green, function()
+    applyHitboxPulsePreset("Fastest kills + range", 2, 100000, 1)
+end)
+MoveTab:Button("⚖️", "Mid lag reducer", "Duty 5 · 60,000 studs · HitMob stride 6 (balanced)", C.accent, function()
+    applyHitboxPulsePreset("Mid lag reducer", 5, 60000, 6)
+end)
+MoveTab:Button("🐢", "Large lag reducer", "Duty 10 · 25,000 studs · HitMob stride 14 (lightest)", C.sub, function()
+    applyHitboxPulsePreset("Large lag reducer", 10, 25000, 14)
+end)
 
 -- workspace.[PlayerName] holds the player's equipped weapon models
 -- Each weapon model contains a BasePart named "Hitbox"
@@ -645,7 +762,7 @@ addThread(task.spawn(function()
     local lastCount = 0
     while true do
         if GEN ~= _G.MeleeRNG_Gen then break end
-        task.wait(1)
+        task.wait(2)
         local folder = getPlayerWeaponFolder()
         local count = folder and #folder:GetChildren() or 0
         if count ~= lastCount then
@@ -659,12 +776,21 @@ local function setHitboxPulse(on)
     _pulseActive = on
     hitboxExpanded = on
     if on then
+        _pulseBigVec = Vector3.new(hitboxSize, hitboxSize, hitboxSize)
         _hitboxCacheDirty = true
         if _pulseConn then _pulseConn:Disconnect() end
 
         local _w  = getBestWeaponAsset()
         local _hr = R("HitMob")
         local _wt = 0
+        local _bigPhaseCount = 0
+        local _dutyTick = 0
+        local _mobsSetupBackoff = 0
+        for bi = 1, 200 do
+            if not _batchRows[bi] then
+                _batchRows[bi] = {}
+            end
+        end
 
         _pulseConn = RunService.Heartbeat:Connect(function()
             if GEN ~= _G.MeleeRNG_Gen or not _pulseActive then
@@ -672,48 +798,94 @@ local function setHitboxPulse(on)
                 return
             end
 
-            -- Refresh cache and weapon every ~5s
+            -- Refresh cache and weapon every ~5s; compact mob list (cheap vs GetChildren every pulse)
             _wt = _wt + 1
-            if _wt > 300 then
+            if _wt > 480 then
                 _wt = 0
                 _w  = getBestWeaponAsset()
                 _hr = R("HitMob")
+                compactMobPulseCache()
+                if not (_cachedMobsFolder and _cachedMobsFolder.Parent) then
+                    setupMobPulseCache()
+                end
                 if _hitboxCacheDirty then rebuildHitboxCache() end
             elseif _hitboxCacheDirty then
                 rebuildHitboxCache()
             end
 
-            -- Flip ALL hitbox parts this frame — no throttle, every Heartbeat
-            _pulsePhase = not _pulsePhase
-            local newSize = _pulsePhase
-                and Vector3.new(hitboxSize, hitboxSize, hitboxSize)
-                or _TINY_V
-            for i = 1, #_hitboxCache do
-                local hb = _hitboxCache[i]
-                if hb and hb.Parent then hb.Size = newSize
-                else _hitboxCacheDirty = true end
-            end
-
-            -- Direct batch on every big phase — hits ALL mobs, no distance limit
-            if not _pulsePhase or not _hr or not _w then return end
-            local mobs = workspace:FindFirstChild("Mobs")
-            if not mobs then return end
-            local batch = {}
-            local children = mobs:GetChildren()
-            for _, m in ipairs(children) do
-                if m:IsA("Model") then
-                    local id = m:GetAttribute("ID")
-                    if id then batch[#batch+1] = {id, farmDmgBase, _w} end
+            -- Duty cycle: BIG only 1 frame per N (rest TINY). Cuts physics cost of huge hitboxes; still flips size each big frame vs prior tiny.
+            _dutyTick = _dutyTick + 1
+            local duty = math.clamp(math.floor(tonumber(states.hitboxDutyCycle) or 2), 2, HITBOX_DUTY_MAX)
+            _pulsePhase = ((_dutyTick - 1) % duty) == 0
+            local newSize = _pulsePhase and _pulseBigVec or _TINY_V
+            local hCache = _hitboxCache
+            local nh = #hCache
+            for i = 1, nh do
+                local hb = hCache[i]
+                if hb and hb.Parent then
+                    if hb.Size ~= newSize then hb.Size = newSize end
+                else
+                    _hitboxCacheDirty = true
                 end
             end
-            if #batch > 0 then
+
+            -- Direct batch on big phase — throttled by hitmobFireStride to cut FireServer cost
+            if not _pulsePhase or not _hr or not _w then return end
+            if not (_cachedMobsFolder and _cachedMobsFolder.Parent) then
+                _mobsSetupBackoff = _mobsSetupBackoff + 1
+                if _mobsSetupBackoff >= 36 then
+                    _mobsSetupBackoff = 0
+                    setupMobPulseCache()
+                end
+            else
+                _mobsSetupBackoff = 0
+            end
+            if not _cachedMobsFolder then return end
+
+            _bigPhaseCount = _bigPhaseCount + 1
+            local stride = math.clamp(math.floor(tonumber(states.hitmobFireStride) or 2), 1, HITMOB_STRIDE_MAX)
+            if (_bigPhaseCount - 1) % stride ~= 0 then return end
+
+            local nBatch = 0
+            local entries = _mobEntries
+            local ne = #entries
+            for i = 1, ne do
+                local e = entries[i]
+                local m = e.m
+                if m.Parent then
+                    local id = e.id
+                    if id == nil then
+                        id = m:GetAttribute("ID")
+                        e.id = id
+                    end
+                    if id then
+                        nBatch = nBatch + 1
+                        local row = _batchRows[nBatch]
+                        if not row then
+                            row = {}
+                            _batchRows[nBatch] = row
+                        end
+                        row[1], row[2], row[3] = id, farmDmgBase, _w
+                    end
+                end
+            end
+            if nBatch > 0 then
+                local batch = _scratchFireBatch
+                for bi = 1, nBatch do
+                    batch[bi] = _batchRows[bi]
+                end
+                for j = nBatch + 1, #batch do
+                    batch[j] = nil
+                end
                 pcall(function() _hr:FireServer(batch) end)
             end
         end)
         addConn(_pulseConn)
         rebuildHitboxCache()
-        SLbl.Text = string.format("⚡ Pulse ON — every frame at %.0f studs (%d hitboxes)", hitboxSize, #_hitboxCache)
+        setupMobPulseCache()
+        SLbl.Text = string.format("⚡ Pulse ON | %.0f studs | %d hitboxes | duty 1/%d", hitboxSize, #_hitboxCache, math.clamp(math.floor(tonumber(states.hitboxDutyCycle) or 2), 2, HITBOX_DUTY_MAX))
     else
+        tearDownMobPulseCache()
         if _pulseConn then _pulseConn:Disconnect(); _pulseConn = nil end
         for i = 1, #_hitboxCache do
             local hb = _hitboxCache[i]
@@ -1478,6 +1650,7 @@ MiscTab:Button("🛑", "Stop All Loops", "Disconnects all connections and cancel
     hitboxExpanded = false
     _pulseActive   = false
     if _pulseConn then pcall(function() _pulseConn:Disconnect() end); _pulseConn = nil end
+    pcall(tearDownMobPulseCache)
     pcall(restoreHitboxes)
     SLbl.Text = "All loops stopped. Re-execute to restart."
 end)
