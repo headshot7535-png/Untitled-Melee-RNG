@@ -100,27 +100,8 @@ local function getAscendKillsRequired()
     return (2 + (tonumber(getAscends()) or 0)) * 1000000
 end
 
--- After ascend: TP once here only if leaderstats Ascends actually increased (Forgotten Valley — from [MeleeRNG] pos log)
-local ASCEND_SUCCESS_CFRAME = CFrame.new(496.9, 222.1, -7380.4)
-
---- @return true if Ascends rose above beforeAscends and we teleported once
-local function teleportAfterAscendIfConfirmed(beforeAscends)
-    beforeAscends = tonumber(beforeAscends) or 0
-    for _ = 1, 35 do
-        task.wait(0.1)
-        local now = tonumber(getAscends()) or 0
-        if now > beforeAscends then
-            local root = getRoot()
-            if root then
-                pcall(function()
-                    root.CFrame = ASCEND_SUCCESS_CFRAME * CFrame.new(0, 3, 0)
-                end)
-            end
-            return true
-        end
-    end
-    return false
-end
+-- Default post-ascend TP (Forgotten Valley — original log); player can override in Misc → Ascend
+local DEF_ASCEND_TP_X, DEF_ASCEND_TP_Y, DEF_ASCEND_TP_Z = 496.9, 222.1, -7380.4
 
 -- ── Remote cache ─────────────────────────────────────────────
 local _remotes = {}
@@ -234,6 +215,10 @@ local states = {
     hitboxPulse    = false,
     hitboxDutyCycle  = 2,  -- BIG on 1 frame per N heartbeats (2 = half the frames big, old behavior; 6+ = mostly tiny, less physics lag)
     autoUpgradeOn  = false,  -- master Auto Upgrade loop (saved with other toggles)
+    -- After ascend: TP target (HumanoidRootPart + 3 studs Y); set via Misc → Ascend
+    ascendAfterTpX = DEF_ASCEND_TP_X,
+    ascendAfterTpY = DEF_ASCEND_TP_Y,
+    ascendAfterTpZ = DEF_ASCEND_TP_Z,
     -- Sacrifice (Fountain) — OneIn tiers from RS.Assets.Weapons; only By color + By name
     autoSacrifice    = false,
     sacFilterColor   = false,  -- OneIn ≤ selected tier max (game color / rarity)
@@ -334,31 +319,53 @@ states.sacFilterColor = states.sacFilterColor == true
 states.sacFilterName  = states.sacFilterName == true
 states.sacRarityCapIdx = math.clamp(math.floor(tonumber(states.sacRarityCapIdx) or 1), 1, 9)
 states.sacKeepQty      = math.clamp(math.floor(tonumber(states.sacKeepQty) or 0), 0, 999)
+states.ascendAfterTpX  = tonumber(states.ascendAfterTpX) or DEF_ASCEND_TP_X
+states.ascendAfterTpY  = tonumber(states.ascendAfterTpY) or DEF_ASCEND_TP_Y
+states.ascendAfterTpZ  = tonumber(states.ascendAfterTpZ) or DEF_ASCEND_TP_Z
+
+local function getAscendAfterTpCFrame()
+    local x = tonumber(states.ascendAfterTpX) or DEF_ASCEND_TP_X
+    local y = tonumber(states.ascendAfterTpY) or DEF_ASCEND_TP_Y
+    local z = tonumber(states.ascendAfterTpZ) or DEF_ASCEND_TP_Z
+    x = math.clamp(x, -500000, 500000)
+    y = math.clamp(y, -50000, 500000)
+    z = math.clamp(z, -500000, 500000)
+    return CFrame.new(x, y, z)
+end
+
+--- TP once if leaderstats Ascends increased after ConfirmAscend
+local function teleportAfterAscendIfConfirmed(beforeAscends)
+    beforeAscends = tonumber(beforeAscends) or 0
+    for _ = 1, 35 do
+        task.wait(0.1)
+        local now = tonumber(getAscends()) or 0
+        if now > beforeAscends then
+            local root = getRoot()
+            if root then
+                pcall(function()
+                    root.CFrame = getAscendAfterTpCFrame() * CFrame.new(0, 3, 0)
+                end)
+            end
+            return true
+        end
+    end
+    return false
+end
+
+local function formatAscendTpSaved()
+    return string.format("X=%.2f Y=%.2f Z=%.2f",
+        tonumber(states.ascendAfterTpX) or DEF_ASCEND_TP_X,
+        tonumber(states.ascendAfterTpY) or DEF_ASCEND_TP_Y,
+        tonumber(states.ascendAfterTpZ) or DEF_ASCEND_TP_Z)
+end
 
 -- ============================================================
---  BUILD WINDOW
+--  BUILD WINDOW  (tabs: Move → ESP → Areas → Upgrades → Sacrifice → Chat → Misc)
 -- ============================================================
 local Win  = Lib:Window({ title = "⚔️  Melee RNG  v1.0" })
 local SLbl = Win._status
 
-local MoveTab = Win:Tab("🚀",  "Movement")
-local ESPTab  = Win:Tab("👁️",  "ESP")
-local AreaTab = Win:Tab("🗺️",  "Areas")
-
--- ============================================================
---  AUTO UPGRADE TAB
---  Currency: SP (leaderstats "⚠ SP")
---  Remotes (all confirmed from dump):
---    GetUnlockedUpgrades:InvokeServer() → {name=bool}
---    GetUpgradeLevel:InvokeServer(name) → number
---    BuyUpgrade:InvokeServer(name)      → bool (true=success)
---  Price functions (from SharedConstants.Upgrades module):
---    replicated client-side so we can check affordability without a remote
--- ============================================================
-local MiscTab = Win:Tab("⚙️",  "Misc")
-local UpgTab  = Win:Tab("⬆️",  "Auto Upgrade")
-
--- ── Colour theme ──────────────────────────────────────────────
+-- Shared palette / status cards (used by every tab)
 local C = {
     bg=Color3.fromRGB(8,10,18), card=Color3.fromRGB(15,19,32),
     border=Color3.fromRGB(25,35,60), accent=Color3.fromRGB(0,180,255),
@@ -417,6 +424,14 @@ local function makeStatusCard(page, lo, titleStr, accentCol)
     return { Card=Card, Title=Title, Status=Status, Info1=Info1, Info2=Info2,
              Pill=Pill, PBtn=PBtn, stroke=stroke, setState=setState }
 end
+
+local MoveTab = Win:Tab("🚀",  "Move")
+local ESPTab  = Win:Tab("👁️",  "ESP")
+local AreaTab = Win:Tab("🗺️",  "Areas")
+local UpgTab  = Win:Tab("⬆️",  "Upgrades")
+local SacTab  = Win:Tab("🕯️", "Sacrifice")
+
+-- Auto upgrade: SP, GetUnlockedUpgrades / GetUpgradeLevel / BuyUpgrade (prices = SharedConstants client copy)
 
 -- Price functions — exact copies from SharedConstants.Upgrades (dump lines 3601-3690)
 local UPGRADE_PRICES = {
@@ -565,10 +580,9 @@ addThread(task.spawn(function()
 end))
 
 -- ============================================================
---  SACRIFICE TAB — GetWeaponsInv / FountainSacrifice
+--  SACRIFICE TAB UI (Win:Tab created with other tabs)
 --  Rarity = weapon:GetAttribute("OneIn") on RS.Assets.Weapons (matches in-game colors)
 -- ============================================================
-local SacTab = Win:Tab("🕯️", "Sacrifice")
 
 -- OneIn max per tier (sacrifice weapons with OneIn ≤ cap for selected row)
 local SAC_TIERS = {
@@ -932,6 +946,7 @@ addThread(task.spawn(function()
 end))
 
 Win:ChatTab()
+local MiscTab = Win:Tab("⚙️", "Misc")
 
 -- ============================================================
 -- Cache hitbox parts so we don't scan descendants every frame
@@ -1341,134 +1356,6 @@ task.spawn(function()
 end)
 
 -- ============================================================
---  MISC TAB
--- ============================================================
-
--- ============================================================
-MiscTab:Section("UI Buttons")
-MiscTab:Toggle("👁️ Show AutoRaid Button", "Keeps AutoRaidBtn visible — saved & applied on load", states.showAutoRaid, function(on)
-    states.showAutoRaid = on; saveSettings()
-    pcall(function()
-        LP.PlayerGui:WaitForChild("MainGUI",3)
-            :WaitForChild("OptionsList",3)
-            :WaitForChild("AutoRaidBtn",3).Visible = on
-    end)
-    SLbl.Text = on and "✓ AutoRaidBtn shown" or "AutoRaidBtn hidden"
-end)
-MiscTab:Toggle("🙈 Show HideMobs Button", "Keeps HideMobsBtn visible — saved & applied on load", states.showHideMobs, function(on)
-    states.showHideMobs = on; saveSettings()
-    pcall(function()
-        LP.PlayerGui:WaitForChild("MainGUI",3)
-            :WaitForChild("OptionsList",3)
-            :WaitForChild("HideMobsBtn",3).Visible = on
-    end)
-    SLbl.Text = on and "✓ HideMobsBtn shown" or "HideMobsBtn hidden"
-end)
-
-MiscTab:Section("Machines (workspace.Machines)")
-MiscTab:Label("Open via ProximityPrompt only — no teleport (needs executor fireproximityprompt).")
-
-local MACHINE_NAMES = {"Fountain Of Skill", "Fusion Machine", "Totem Of Fortune", "Weapon Crafter"}
-for _, mname in ipairs(MACHINE_NAMES) do
-    local mn = mname
-    MiscTab:Button("🔧", mn, "Fire " .. mn .. " ProximityPrompt from range (no TP)", C.accent, function()
-        local machines = workspace:FindFirstChild("Machines")
-        local machine  = machines and machines:FindFirstChild(mn)
-        if not machine then SLbl.Text = "⚠ " .. mn .. " not found in workspace.Machines"; return end
-        local prompt = machine:FindFirstChild("ProximityPrompt")
-        if prompt then
-            local ok = pcall(function() fireproximityprompt(prompt) end)
-            SLbl.Text = ok and ("✓ Opened: " .. mn) or ("⚠ fireproximityprompt failed — " .. mn)
-        else
-            SLbl.Text = "⚠ No ProximityPrompt on " .. mn
-        end
-    end)
-end
-
-MiscTab:Section("Ascend")
-local autoAscendToggle = MiscTab:Toggle("⬆️ Auto Ascend", "When kills ≥ (2 + your Ascends) × 1M — saved to meleernq_settings.json", states.autoAscend, function(on)
-    states.autoAscend = on == true
-    saveSettings()
-    SLbl.Text = states.autoAscend and "Auto Ascend ON" or "Auto Ascend OFF"
-end)
-
-task.defer(function()
-    pcall(function()
-        if autoAscendToggle and autoAscendToggle.Set then
-            autoAscendToggle.Set(states.autoAscend)
-        end
-    end)
-end)
-MiscTab:Button("⬆️", "Ascend Now", "ConfirmAscend — then TP only if Ascends stat increases", C.gold, function()
-    local beforeA = tonumber(getAscends()) or 0
-    local ok = invokeR("ConfirmAscend")
-    if not ok then
-        SLbl.Text = "⚠ Not ready (kill requirement not met)"
-        return
-    end
-    if teleportAfterAscendIfConfirmed(beforeA) then
-        SLbl.Text = "✓ Ascended — TP X=496.9 Y=222.1 Z=-7380.4"
-    else
-        SLbl.Text = "⚠ Ascends unchanged — no TP (server did not apply ascend?)"
-    end
-end)
-MiscTab:Button("🎯", "Check Ascend Status", "Shows (2+Ascends)×1M kill gate vs your kills + next portal", C.accent, function()
-    local req = getAscendKillsRequired()
-    local have = tonumber(getKills()) or 0
-    local more = math.max(0, req - have)
-    local dest = nil
-    pcall(function()
-        local area = invokeR("GetArea")
-        if not area then return end
-        local np = area:FindFirstChild("NextPortal")
-        if not np then return end
-        dest = np:GetAttribute("Destination")
-    end)
-    SLbl.Text = string.format(
-        "Ascend: %s / %s kills (%s more) | ascends=%s | next → %s",
-        tostring(have), tostring(req), tostring(more), tostring(getAscends()), tostring(dest or "?"))
-end)
-
-MiscTab:Section("Upgrades")
-local UPGRADE_NAMES = {
-    "Weapons Equipped","Damage Multiplier","Enemy Spawn Rate","Enemy Limit",
-    "Mana Multiplier","Spin Speed","RNG Luck","Kill Multiplier",
-    "Skill Point Multiplier","Boss Spawn Chance"
-}
-MiscTab:Button("📊", "Print Upgrade Levels", "Fetches all upgrade levels via GetUnlockedUpgrades", C.accent, function()
-    local upgrades = invokeR("GetUnlockedUpgrades")
-    if not upgrades then SLbl.Text = "⚠ GetUnlockedUpgrades returned nil"; return end
-    for _, name in ipairs(UPGRADE_NAMES) do
-        local level = invokeR("GetUpgradeLevel", name) or 0
-        local val   = invokeR("GetUpgradeValue", name) or 0
-        print(string.format("[MeleeRNG] %-30s  Lv%d  Value: %s", name, level, tostring(val)))
-    end
-    SLbl.Text = "Upgrade levels printed to output"
-end)
-
-MiscTab:Section("Remote Logger")
-local logActive = false
-local loggedRemotes = {}
-MiscTab:Toggle("📡 Remote Logger", "Hooks DropLoot OnClientEvent to log incoming loot", false, function(on)
-    logActive = on
-    if on then
-        local dr = RS.Remotes and RS.Remotes:FindFirstChild("DropLoot")
-        if dr then
-            local conn = dr.OnClientEvent:Connect(function(model, pos, ref)
-                if not logActive then return end
-                local rarity = model and model:GetAttribute("OneIn") or "?"
-                print(string.format("[MeleeRNG][Loot] %s | OneIn: %s | Ref: %s",
-                    model and model.Name or "?", tostring(rarity), tostring(ref)))
-            end)
-            addConn(conn)
-            SLbl.Text = "Remote logger: DropLoot hooked"
-        else
-            SLbl.Text = "⚠ DropLoot remote not found"
-        end
-    end
-end)
-
--- ============================================================
 --  FEATURE LOGIC LOOPS
 -- ============================================================
 
@@ -1716,7 +1603,7 @@ addThread(task.spawn(function()
             local ok = invokeR("ConfirmAscend")
             if not ok then return end
             if teleportAfterAscendIfConfirmed(beforeA) then
-                SLbl.Text = "✓ Ascended → " .. tostring(dest or "?") .. " | TP set pos"
+                SLbl.Text = "✓ Ascended → " .. tostring(dest or "?") .. " | TP " .. formatAscendTpSaved()
             end
         end)
         task.wait(5)
@@ -1826,6 +1713,135 @@ addThread(task.spawn(function()
     end
 end))
 
+MiscTab:Section("Ascend")
+local autoAscendToggle = MiscTab:Toggle("⬆️ Auto Ascend", "When kills ≥ (2 + your Ascends) × 1M — saved to meleernq_settings.json", states.autoAscend, function(on)
+    states.autoAscend = on == true
+    saveSettings()
+    SLbl.Text = states.autoAscend and "Auto Ascend ON" or "Auto Ascend OFF"
+end)
+
+task.defer(function()
+    pcall(function()
+        if autoAscendToggle and autoAscendToggle.Set then
+            autoAscendToggle.Set(states.autoAscend)
+        end
+    end)
+end)
+
+MiscTab:Label("Post-ascend teleport: stand where you want, tap Set — saved with settings.")
+local ascendTpLbl = MiscTab:Label("")
+local function refreshAscendTpLbl()
+    ascendTpLbl.Set("Saved TP (+3 studs Y): " .. formatAscendTpSaved())
+end
+refreshAscendTpLbl()
+
+MiscTab:Button("📍", "Set Ascend TP Here", "Saves HumanoidRootPart position as after-ascend teleport target", C.green, function()
+    local root = getRoot()
+    if not root then SLbl.Text = "⚠ No character"; return end
+    local p = root.Position
+    states.ascendAfterTpX = p.X
+    states.ascendAfterTpY = p.Y
+    states.ascendAfterTpZ = p.Z
+    saveSettings()
+    refreshAscendTpLbl()
+    SLbl.Text = "✓ Ascend TP saved — " .. formatAscendTpSaved()
+end)
+MiscTab:Button("↩", "Reset Ascend TP to Default", "Forgotten Valley coords (496.9, 222.1, -7380.4)", C.sub, function()
+    states.ascendAfterTpX = DEF_ASCEND_TP_X
+    states.ascendAfterTpY = DEF_ASCEND_TP_Y
+    states.ascendAfterTpZ = DEF_ASCEND_TP_Z
+    saveSettings()
+    refreshAscendTpLbl()
+    SLbl.Text = "✓ Ascend TP reset to default"
+end)
+
+MiscTab:Button("⬆️", "Ascend Now", "ConfirmAscend — then TP only if Ascends stat increases", C.gold, function()
+    local beforeA = tonumber(getAscends()) or 0
+    local ok = invokeR("ConfirmAscend")
+    if not ok then
+        SLbl.Text = "⚠ Not ready (kill requirement not met)"
+        return
+    end
+    if teleportAfterAscendIfConfirmed(beforeA) then
+        SLbl.Text = "✓ Ascended — TP " .. formatAscendTpSaved()
+    else
+        SLbl.Text = "⚠ Ascends unchanged — no TP (server did not apply ascend?)"
+    end
+end)
+MiscTab:Button("🎯", "Check Ascend Status", "Shows (2+Ascends)×1M kill gate vs your kills + next portal", C.accent, function()
+    local req = getAscendKillsRequired()
+    local have = tonumber(getKills()) or 0
+    local more = math.max(0, req - have)
+    local dest = nil
+    pcall(function()
+        local area = invokeR("GetArea")
+        if not area then return end
+        local np = area:FindFirstChild("NextPortal")
+        if not np then return end
+        dest = np:GetAttribute("Destination")
+    end)
+    SLbl.Text = string.format(
+        "Ascend: %s / %s kills (%s more) | ascends=%s | next → %s",
+        tostring(have), tostring(req), tostring(more), tostring(getAscends()), tostring(dest or "?"))
+end)
+
+MiscTab:Section("Machines (workspace.Machines)")
+MiscTab:Label("Open via ProximityPrompt only — no teleport (needs executor fireproximityprompt).")
+
+local MACHINE_NAMES = {"Fountain Of Skill", "Fusion Machine", "Totem Of Fortune", "Weapon Crafter"}
+for _, mname in ipairs(MACHINE_NAMES) do
+    local mn = mname
+    MiscTab:Button("🔧", mn, "Fire " .. mn .. " ProximityPrompt from range (no TP)", C.accent, function()
+        local machines = workspace:FindFirstChild("Machines")
+        local machine  = machines and machines:FindFirstChild(mn)
+        if not machine then SLbl.Text = "⚠ " .. mn .. " not found in workspace.Machines"; return end
+        local prompt = machine:FindFirstChild("ProximityPrompt")
+        if prompt then
+            local ok = pcall(function() fireproximityprompt(prompt) end)
+            SLbl.Text = ok and ("✓ Opened: " .. mn) or ("⚠ fireproximityprompt failed — " .. mn)
+        else
+            SLbl.Text = "⚠ No ProximityPrompt on " .. mn
+        end
+    end)
+end
+
+MiscTab:Section("Game UI")
+MiscTab:Toggle("👁️ Show AutoRaid Button", "Keeps AutoRaidBtn visible — saved & applied on load", states.showAutoRaid, function(on)
+    states.showAutoRaid = on; saveSettings()
+    pcall(function()
+        LP.PlayerGui:WaitForChild("MainGUI",3)
+            :WaitForChild("OptionsList",3)
+            :WaitForChild("AutoRaidBtn",3).Visible = on
+    end)
+    SLbl.Text = on and "✓ AutoRaidBtn shown" or "AutoRaidBtn hidden"
+end)
+MiscTab:Toggle("🙈 Show HideMobs Button", "Keeps HideMobsBtn visible — saved & applied on load", states.showHideMobs, function(on)
+    states.showHideMobs = on; saveSettings()
+    pcall(function()
+        LP.PlayerGui:WaitForChild("MainGUI",3)
+            :WaitForChild("OptionsList",3)
+            :WaitForChild("HideMobsBtn",3).Visible = on
+    end)
+    SLbl.Text = on and "✓ HideMobsBtn shown" or "HideMobsBtn hidden"
+end)
+
+MiscTab:Section("Upgrades (debug)")
+local UPGRADE_NAMES = {
+    "Weapons Equipped","Damage Multiplier","Enemy Spawn Rate","Enemy Limit",
+    "Mana Multiplier","Spin Speed","RNG Luck","Kill Multiplier",
+    "Skill Point Multiplier","Boss Spawn Chance"
+}
+MiscTab:Button("📊", "Print Upgrade Levels", "Fetches all upgrade levels via GetUnlockedUpgrades", C.accent, function()
+    local upgrades = invokeR("GetUnlockedUpgrades")
+    if not upgrades then SLbl.Text = "⚠ GetUnlockedUpgrades returned nil"; return end
+    for _, name in ipairs(UPGRADE_NAMES) do
+        local level = invokeR("GetUpgradeLevel", name) or 0
+        local val   = invokeR("GetUpgradeValue", name) or 0
+        print(string.format("[MeleeRNG] %-30s  Lv%d  Value: %s", name, level, tostring(val)))
+    end
+    SLbl.Text = "Upgrade levels printed to output"
+end)
+
 MiscTab:Section("Community")
 MiscTab:Button("💬", "Join Discord", "Opens discord.gg/vSTmMTyw in browser", C.purple, function()
     if setclipboard then
@@ -1838,7 +1854,7 @@ MiscTab:Button("💬", "Join Discord", "Opens discord.gg/vSTmMTyw in browser", C
     SLbl.Text = "discord.gg/vSTmMTyw — link copied!"
 end)
 
-MiscTab:Section("Script Control")
+MiscTab:Section("Script")
 MiscTab:Toggle("🔁 Auto Rejoin", "Re-executes on disconnect or hop", states.autoReExec, function(on)
     states.autoReExec = on
     saveSettings()
