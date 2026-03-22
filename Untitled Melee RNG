@@ -1217,7 +1217,7 @@ MoveTab:Toggle("🦅 Fly", "WASD + E/Q to go up/down", states.fly, function(on)
         if flyBG then flyBG:Destroy(); flyBG = nil end
     end
 end)
-MoveTab:Toggle("⏱️ Anti AFK", "Every 60s: synthetic left click via VirtualInputManager (InputBegan) so the game’s AFK timer resets; falls back to VirtualUser:ClickButton1", states.antiAfk, function(on)
+MoveTab:Toggle("⏱️ Anti AFK", "Game AFKScript is disabled on load (no kick timer). Optional: every 60s synthetic click if you still want input-based backup.", states.antiAfk, function(on)
     states.antiAfk = on; saveSettings()
 end)
 MoveTab:Toggle("💡 Full Bright", "Max ambient light, remove fog", states.fullBright, function(on)
@@ -1519,8 +1519,36 @@ addConn(RunService.Heartbeat:Connect(function()
 end))
 
 -- ── Anti AFK ─────────────────────────────────────────────────
--- Game AFK uses InputBegan (e.g. u5 = tick()); VirtualUser:ClickButton2 is camera-side and skips that path.
--- VirtualInputManager:SendMouseButtonEvent fires a real LMB press → InputBegan. Interval 60s ≪ 840s kick.
+-- Kill the game’s AFK LocalScript (no getrawmetatable / newcclosure). Stops its RenderStepped / TP kick path.
+local function disableGameAfkScript()
+    pcall(function()
+        local ps = LP:FindFirstChild("PlayerScripts")
+        if not ps then return end
+        local s = ps:FindFirstChild("AFKScript")
+        if s and s:IsA("LocalScript") then
+            s.Disabled = true
+        end
+    end)
+end
+
+addThread(task.spawn(function()
+    local ps = LP:WaitForChild("PlayerScripts", 45)
+    if GEN ~= _G.MeleeRNG_Gen or not ps then return end
+    disableGameAfkScript()
+    addConn(ps.ChildAdded:Connect(function(child)
+        if GEN ~= _G.MeleeRNG_Gen then return end
+        if child.Name == "AFKScript" and child:IsA("LocalScript") then
+            child.Disabled = true
+        end
+    end))
+    while GEN == _G.MeleeRNG_Gen do
+        task.wait(8)
+        disableGameAfkScript()
+    end
+end))
+
+-- Optional backup: game AFK sometimes keys off InputBegan; VIM click path + VirtualUser fallback.
+-- VirtualUser:ClickButton2 is camera-side and skips that path.
 local function sendAntiAfkInput()
     local vx, vy = 1, 1
     local cam = workspace.CurrentCamera
@@ -1920,10 +1948,16 @@ MiscTab:Button("💬", "Join Discord", "Opens discord.gg/vSTmMTyw in browser", C
 end)
 
 MiscTab:Section("Script")
-MiscTab:Toggle("🔁 Auto Rejoin", "Re-executes on disconnect or hop", states.autoReExec, function(on)
+MiscTab:Toggle("🔁 Auto Rejoin", "Queues script on server teleport / disconnect hop only; throttled so executors cannot spam re-exec", states.autoReExec, function(on)
     states.autoReExec = on
     saveSettings()
     SLbl.Text = on and "Auto Rejoin ON" or "Auto Rejoin OFF"
+    if on then
+        pcall(function()
+            local f = _G.MeleeRNG_ArmReexecQueue
+            if f then f("toggle_ui") end
+        end)
+    end
 end)
 MiscTab:Toggle("💾 Auto Save", "Automatically saves all toggle/slider states to disk", states.autoSave, function(on)
     states.autoSave = on
@@ -1970,9 +2004,12 @@ MiscTab:Button("💾", "Save Settings", "Force-saves current toggle/slider state
     SLbl.Text = "Settings saved to " .. SETTINGS_FILE
 end)
 
--- ── Auto re-exec (ANIPIXELS GUI v5.0 pattern: queue_on_teleport + OnTeleport) ──
+-- ── Auto re-exec (queue_on_teleport + OnTeleport) ────────────────────────────
+-- Some executors re-fire queued scripts immediately or stack queues — debounce + single load arm.
 do
     local REEXEC_URL = SCRIPT_URL
+    local QUEUE_MIN_INTERVAL = 12  -- seconds between queue_on_teleport calls (same session / gen)
+
     if _G.MeleeRNG_AutoRejoin and not states.autoReExec then
         states.autoReExec = true
         saveSettings()
@@ -1981,38 +2018,49 @@ do
         _G.MeleeRNG_AutoRejoin = states.autoReExec
     end
     syncMeleeRejoinFlag()
-    pcall(function()
-        LP.OnTeleport:Connect(function(teleportState)
-            if teleportState == Enum.TeleportState.RequestedByServer then
-                syncMeleeRejoinFlag()
-                if queue_on_teleport and states.autoReExec then
-                    pcall(function()
-                        queue_on_teleport('loadstring(game:HttpGet("' .. REEXEC_URL .. '",true))()')
-                    end)
-                end
-            end
-        end)
-    end)
-    local function armQueue()
+
+    local function armQueue(reason)
+        if not queue_on_teleport or not states.autoReExec then return end
+        local now = os.clock()
+        local last = _G.MeleeRNG_QueueLastClock
+        if type(last) == "number" and (now - last) < QUEUE_MIN_INTERVAL then
+            return
+        end
+        _G.MeleeRNG_QueueLastClock = now
         pcall(function()
-            if queue_on_teleport and states.autoReExec then
-                queue_on_teleport('loadstring(game:HttpGet("' .. REEXEC_URL .. '",true))()')
-            end
+            queue_on_teleport('loadstring(game:HttpGet("' .. REEXEC_URL .. '",true))()')
         end)
     end
-    armQueue()
+
+    pcall(function()
+        LP.OnTeleport:Connect(function(teleportState)
+            if teleportState ~= Enum.TeleportState.RequestedByServer then return end
+            if GEN ~= _G.MeleeRNG_Gen then return end
+            syncMeleeRejoinFlag()
+            armQueue("teleport")
+        end)
+    end)
+
+    -- Arm once if already ON from settings (do not double-arm via the poller below)
+    if states.autoReExec then
+        armQueue("load")
+    end
+
     task.spawn(function()
-        local wasOn = false
+        -- Match saved state so we don't fire armQueue again 2s later on every load
+        local wasOn = states.autoReExec == true
         while true do
             if GEN ~= _G.MeleeRNG_Gen then break end
             task.wait(2)
             syncMeleeRejoinFlag()
             if states.autoReExec and not wasOn then
-                pcall(armQueue)
+                armQueue("toggle_on")
             end
-            wasOn = states.autoReExec
+            wasOn = states.autoReExec == true
         end
     end)
+
+    _G.MeleeRNG_ArmReexecQueue = armQueue
 end
 
 -- ============================================================
