@@ -226,6 +226,14 @@ local states = {
     sacFilterName    = false,
     sacRarityCapIdx  = 1,     -- 1–9 = dropdown tier cap (see SAC_TIERS)
     sacKeepQty       = 0,    -- 0–999; persisted + synced on load
+    -- Totem of Fortune — TotemConfirm(weaponName); cap 25 + AP level×5; 1h CD when server returns false
+    -- Filters are separate from Fountain sacrifice (own color cap + keep qty)
+    autoTotem           = false,
+    totemFilterColor    = false,  -- OneIn ≤ totemRarityCapIdx (independent of Fountain)
+    totemRarityCapIdx   = 1,
+    totemKeepQty        = 0,
+    totemDoneThisCycle  = 0,
+    totemCapHitUnix     = nil, -- os.time() when server capped (starts 1h cycle lock)
 }
 
 -- Upgrade names for save/load (must exist before saveSettings references upgradeSelected)
@@ -324,6 +332,16 @@ states.sacKeepQty      = math.clamp(math.floor(tonumber(states.sacKeepQty) or 0)
 states.ascendAfterTpX  = tonumber(states.ascendAfterTpX) or DEF_ASCEND_TP_X
 states.ascendAfterTpY  = tonumber(states.ascendAfterTpY) or DEF_ASCEND_TP_Y
 states.ascendAfterTpZ  = tonumber(states.ascendAfterTpZ) or DEF_ASCEND_TP_Z
+
+states.autoTotem = states.autoTotem == true
+states.totemFilterColor = states.totemFilterColor == true
+states.totemRarityCapIdx = math.clamp(math.floor(tonumber(states.totemRarityCapIdx) or 1), 1, 9)
+states.totemKeepQty = math.clamp(math.floor(tonumber(states.totemKeepQty) or 0), 0, 999)
+states.totemDoneThisCycle = math.max(0, math.floor(tonumber(states.totemDoneThisCycle) or 0))
+do
+    local tcu = tonumber(states.totemCapHitUnix)
+    states.totemCapHitUnix = tcu -- nil if not a valid number
+end
 
 local function getAscendAfterTpCFrame()
     local x = tonumber(states.ascendAfterTpX) or DEF_ASCEND_TP_X
@@ -724,6 +742,179 @@ local function sacWeaponPasses(w)
     return false
 end
 
+-- ── Totem of Fortune (TotemConfirm) — rarity by OneIn color; highest Rank first (luck = Rank/10% per slot)
+local TOTEM_AP_UPGRADE_NAME = "Totem Of Fortune Sacrifices"
+local TOTEM_CYCLE_SEC       = 3600
+local TOTEM_BASE_MAX        = 25
+local _totemApCache         = { t = 0, lvl = 0 }
+-- Server-confirmed cap from RS.Remotes.SendNotification (message, "ERROR") when totem hits max
+local _totemServerMax          = nil
+local _totemCapViaNotification = false
+
+local function totemParseMaxFromNotification(msg)
+    if type(msg) ~= "string" then return nil end
+    -- "You can only sacrifice max 40 weapons every hour!"
+    local nmax = msg:match("[Mm]ax%s+(%d+)")
+    if nmax then
+        local n = tonumber(nmax)
+        if n and n >= 1 and n <= 999 then return math.floor(n) end
+    end
+    local _, mx = msg:match("(%d+)%s*/%s*(%d+)")
+    if mx then
+        local n = tonumber(mx)
+        if n then return math.floor(n) end
+    end
+    _, mx = msg:match("(%d+)%s+of%s+(%d+)")
+    if mx then
+        local n = tonumber(mx)
+        if n then return math.floor(n) end
+    end
+    local best = nil
+    for n in msg:gmatch("%d+") do
+        local v = math.floor(tonumber(n) or 0)
+        if v >= 1 and v <= 500 then
+            if not best or v > best then best = v end
+        end
+    end
+    return best
+end
+
+local function totemNotificationLooksLikeCap(msg)
+    if type(msg) ~= "string" then return false end
+    local m = msg:lower()
+    -- Server string has no "totem" — e.g. "sacrifice max 40 ... every hour!"
+    if m:find("sacrifice", 1, true) and m:find("every hour", 1, true) then return true end
+    if m:find("totem", 1, true) == nil and m:find("fortune", 1, true) == nil then return false end
+    if m:find("max", 1, true) or m:find("limit", 1, true) or m:find("reached", 1, true)
+        or m:find("cap", 1, true) or m:find("full", 1, true) or m:find("cannot", 1, true)
+        or m:find("already", 1, true) then
+        return true
+    end
+    local a, b = msg:match("(%d+)%s*/%s*(%d+)")
+    if a and b and tonumber(a) and tonumber(b) and tonumber(a) >= tonumber(b) then
+        return true
+    end
+    return false
+end
+
+--- ERROR notifications we treat as Totem hourly cap (message text varies; may omit "totem")
+local function totemSendNotificationIsRelevant(message)
+    if type(message) ~= "string" then return false end
+    local m = message:lower()
+    if m:find("totem", 1, true) or m:find("fortune", 1, true) then return true end
+    if m:find("sacrifice", 1, true) and m:find("every hour", 1, true) then return true end
+    return false
+end
+
+local function getTotemApLevel()
+    local now = os.clock()
+    if now - _totemApCache.t < 12 then
+        return _totemApCache.lvl
+    end
+    _totemApCache.t = now
+    local lvl = 0
+    pcall(function()
+        local u = invokeR("GetAscendUpgrades")
+        if type(u) == "table" then
+            lvl = math.floor(tonumber(u[TOTEM_AP_UPGRADE_NAME]) or 0)
+            if lvl == 0 then
+                for k, v in pairs(u) do
+                    if type(k) == "string" and k:find("Totem", 1, true) and k:find("Fortune", 1, true) then
+                        local nv = tonumber(v)
+                        if nv then lvl = math.floor(nv); break end
+                    end
+                end
+            end
+        end
+        if lvl == 0 then
+            local alt = invokeR("GetAscendUpgradeLevel", TOTEM_AP_UPGRADE_NAME)
+            lvl = math.floor(tonumber(alt) or 0)
+        end
+    end)
+    _totemApCache.lvl = lvl
+    return lvl
+end
+
+local function getTotemMaxPerCycle()
+    local calc = TOTEM_BASE_MAX + getTotemApLevel() * 5
+    local srv = tonumber(_totemServerMax)
+    if srv and srv > 0 then
+        return srv
+    end
+    return calc
+end
+
+--- Returns isOnCooldown, secondsRemaining (0 if not on CD). Clears cycle when CD elapsed.
+local function totemInCooldown()
+    local hit = states.totemCapHitUnix
+    if not hit then return false, 0 end
+    local now = os.time()
+    local elapsed = now - hit
+    if elapsed >= TOTEM_CYCLE_SEC then
+        states.totemCapHitUnix = nil
+        states.totemDoneThisCycle = 0
+        _totemCapViaNotification = false
+        _totemServerMax = nil
+        if states.autoSave then saveSettings() else forceSave() end
+        return false, 0
+    end
+    return true, TOTEM_CYCLE_SEC - elapsed
+end
+
+local function totemWeaponPassesColor(w)
+    if not states.totemFilterColor then return false end
+    local cap = sacCapOneInForDropdownIdx(states.totemRarityCapIdx)
+    local oi = tonumber(w.oneIn)
+    if not oi or oi == math.huge then return false end
+    return oi <= cap
+end
+
+local function formatTotemCd(secs)
+    secs = math.max(0, math.floor(secs))
+    local m = math.floor(secs / 60)
+    local s = secs % 60
+    return string.format("%dm%ds", m, s)
+end
+
+local totemStatusLbl
+local function updateTotemStatusLbl()
+    if not totemStatusLbl then return end
+    local maxC = getTotemMaxPerCycle()
+    local onCd, remain = totemInCooldown()
+    local done = math.min(math.max(0, states.totemDoneThisCycle), maxC)
+    local cdStr = onCd and formatTotemCd(remain) or "ready"
+    if _totemCapViaNotification and onCd then
+        totemStatusLbl.Set(string.format("Cap hit | Max=%d (server confirmed) · CD: %s", maxC, cdStr))
+    else
+        totemStatusLbl.Set(string.format("Totem: %d/%d done | CD: %s | AP max: %d", done, maxC, cdStr, maxC))
+    end
+end
+
+local function onTotemSendNotification(message, msgType)
+    if GEN ~= _G.MeleeRNG_Gen then return end
+    if type(message) ~= "string" then return end
+    local mt = type(msgType) == "string" and msgType:upper() or ""
+    if mt ~= "ERROR" then return end
+    if not totemSendNotificationIsRelevant(message) then return end
+
+    local parsedMax = totemParseMaxFromNotification(message)
+    if not parsedMax or parsedMax < 1 then return end
+
+    _totemServerMax = parsedMax
+    _totemApCache.t = 0
+
+    if not totemNotificationLooksLikeCap(message) then
+        updateTotemStatusLbl()
+        return
+    end
+
+    states.totemDoneThisCycle = parsedMax
+    states.totemCapHitUnix = os.time()
+    _totemCapViaNotification = true
+    saveSettings()
+    updateTotemStatusLbl()
+end
+
 SacTab:Section("Sacrifice")
 SacTab:Label("All options below save to meleernq_settings.json (with Auto Save on). Weapon name ticks save too.")
 SacTab:Label("Refresh ties each weapon to RS.Assets.Weapons for OneIn (color tier). Auto-refresh ~2s after load.")
@@ -813,6 +1004,49 @@ local function refreshSacInventory()
     SLbl.Text = string.format("Sacrifice: %d weapon types (OneIn from Assets)", #_sacInv)
 end
 
+--- One TotemConfirm call: best Rank among color-filtered weapons (respects keep qty).
+local function totemExecuteNext()
+    local onCd = select(1, totemInCooldown())
+    if onCd then return false, "cd" end
+    local maxC = getTotemMaxPerCycle()
+    if states.totemDoneThisCycle >= maxC then
+        return false, "local_cap"
+    end
+    refreshSacInventory()
+    local keep = math.max(0, math.floor(tonumber(states.totemKeepQty) or 0))
+    local candidates = {}
+    for _, w in ipairs(_sacInv) do
+        if totemWeaponPassesColor(w) and w.qty > keep then
+            candidates[#candidates + 1] = w
+        end
+    end
+    table.sort(candidates, function(a, b)
+        if a.rank ~= b.rank then return a.rank > b.rank end
+        local oa = tonumber(a.oneIn) or math.huge
+        local ob = tonumber(b.oneIn) or math.huge
+        if oa ~= ob then return oa < ob end
+        return a.name:lower() < b.name:lower()
+    end)
+    local w = candidates[1]
+    if not w then return false, "no_weapon" end
+    local tr = R("TotemConfirm")
+    if not tr then return false, "fail" end
+    local invokeOk, res = pcall(function() return tr:InvokeServer(w.name) end)
+    if not invokeOk then
+        return false, "fail"
+    end
+    -- Server returns false = at cap / rejected; nil or anything else = success (many games return nothing)
+    if res == false then
+        states.totemDoneThisCycle = maxC
+        states.totemCapHitUnix = os.time()
+        saveSettings()
+        return false, "server_cap"
+    end
+    states.totemDoneThisCycle = states.totemDoneThisCycle + 1
+    saveSettings()
+    return true, w.name
+end
+
 SacTab:Button("🔄", "Refresh Inventory", "GetWeaponsInv:InvokeServer() — list + console print", C.accent, function()
     refreshSacInventory()
 end)
@@ -853,6 +1087,62 @@ local sacAutoToggle = SacTab:Toggle("Toggle Auto Sacrifice", "Every 3s: inventor
     saveSettings()
     sacStatusLbl.Set(on and "Auto: ON · every 3s" or "Auto: OFF · idle")
     SLbl.Text = on and "Auto Sacrifice ON" or "Auto Sacrifice OFF"
+end)
+
+SacTab:Section("Totem of Fortune")
+SacTab:Label("Separate from Fountain: own color cap + keep below. Remote: TotemConfirm(weaponName). Luck ~Rank/10% per slot.")
+SacTab:Label("Cap: 25 + AP×5 until RS.Remotes.SendNotification sends ERROR with totem/fortune + max — then uses server max + 1h CD.")
+local totemFilterColorToggle = SacTab:Toggle("Totem: By color (OneIn)", "Totem only — OneIn ≤ tier below (not tied to Fountain filters) — saved", states.totemFilterColor, function(on)
+    states.totemFilterColor = on == true
+    saveSettings()
+end)
+local totemRarityDropdown = SacTab:Dropdown(
+    "Totem — sacrifice up through this color",
+    "Max OneIn for Totem picks only (saved). Same tier table as Fountain.",
+    SAC_DROPDOWN_LABELS,
+    math.clamp(states.totemRarityCapIdx, 1, #SAC_TIERS),
+    function(_, _, idx)
+        states.totemRarityCapIdx = math.clamp(math.floor(tonumber(idx) or 1), 1, #SAC_TIERS)
+        saveSettings()
+    end
+)
+SacTab:Label("Totem tiers (OneIn): ⬜≤5 · 🟩≤50 · 🟦≤200 · 🟣≤5k · 🟠≤50k · 🩷≤1M · 🟤≤7M · 🩵≤11M · ⬛≤99M")
+local totemKeepSlider = SacTab:Slider("Totem — always keep qty", "Per weapon type for Totem only; independent of Fountain keep (saved)", {
+    min = 0, max = 999, default = math.clamp(states.totemKeepQty, 0, 999),
+    format = function(v) return "keep " .. tostring(math.floor(v)) end,
+}, function(v)
+    states.totemKeepQty = math.floor(v)
+    saveSettings()
+end)
+SacTab:Label("Highest Rank first among Totem-eligible weapons.")
+totemStatusLbl = SacTab:Label("Totem: —")
+local totemLastLbl = SacTab:Label("Totem last: —")
+SacTab:Button("📊", "Totem Status", "Refresh progress / cooldown / AP max", C.accent, function()
+    updateTotemStatusLbl()
+    SLbl.Text = "Totem status updated"
+end)
+SacTab:Button("🕯️", "Totem: sacrifice 1 (best Rank)", "Totem By color + Totem keep; one TotemConfirm", C.gold, function()
+    local ok, why = totemExecuteNext()
+    updateTotemStatusLbl()
+    if ok then
+        totemLastLbl.Set("Totem last: " .. tostring(why))
+        SLbl.Text = "Totem: " .. tostring(why)
+    else
+        local msg = ({
+            cd = "On cooldown",
+            local_cap = "At cycle cap (wait CD or refresh)",
+            no_weapon = "No weapon (enable Totem By color or refresh inv)",
+            server_cap = "Server capped — 1h CD started",
+            fail = "TotemConfirm error (remote missing or InvokeServer threw)",
+        })[why] or tostring(why)
+        totemLastLbl.Set("Totem last: " .. msg)
+        SLbl.Text = "Totem: " .. msg
+    end
+end)
+local totemAutoToggle = SacTab:Toggle("Auto Totem", "Every 3s: Totem color cap + keep, highest Rank, TotemConfirm — saved", states.autoTotem, function(on)
+    states.autoTotem = on == true
+    saveSettings()
+    SLbl.Text = on and "Auto Totem ON" or "Auto Totem OFF"
 end)
 
 SacTab:Section("By Name — tick rows")
@@ -912,7 +1202,20 @@ task.defer(function()
         if sacAutoToggle and sacAutoToggle.Set then
             sacAutoToggle.Set(states.autoSacrifice)
         end
+        if totemAutoToggle and totemAutoToggle.Set then
+            totemAutoToggle.Set(states.autoTotem)
+        end
+        if totemFilterColorToggle and totemFilterColorToggle.Set then
+            totemFilterColorToggle.Set(states.totemFilterColor)
+        end
+        if totemRarityDropdown and totemRarityDropdown.Set then
+            totemRarityDropdown.Set(states.totemRarityCapIdx)
+        end
+        if totemKeepSlider and totemKeepSlider.Set then
+            totemKeepSlider.Set(math.clamp(states.totemKeepQty, 0, 999), true)
+        end
         sacStatusLbl.Set(states.autoSacrifice and "Auto: ON · every 3s" or "Auto: OFF · idle")
+        updateTotemStatusLbl()
     end)
 end)
 
@@ -975,6 +1278,48 @@ addThread(task.spawn(function()
         end)
         sacStatusLbl.Set(string.format("Auto: ON · sacrificed %d types · skipped %d · next 3s", sacrificed, skipped))
     end
+end))
+
+addThread(task.spawn(function()
+    while true do
+        if GEN ~= _G.MeleeRNG_Gen then break end
+        task.wait(1)
+        updateTotemStatusLbl()
+    end
+end))
+
+addThread(task.spawn(function()
+    while true do
+        if GEN ~= _G.MeleeRNG_Gen then break end
+        if not states.autoTotem then task.wait(1); continue end
+        task.wait(3)
+        if not states.totemFilterColor then
+            if totemLastLbl then totemLastLbl.Set("Totem auto: turn on Totem: By color (OneIn)") end
+            continue
+        end
+        local ok, why = totemExecuteNext()
+        if totemLastLbl then
+            if ok then
+                totemLastLbl.Set("Totem last: " .. tostring(why))
+            elseif why == "no_weapon" or why == "fail" then
+                totemLastLbl.Set("Totem auto: " .. tostring(why))
+            end
+        end
+        updateTotemStatusLbl()
+    end
+end))
+
+-- Totem: server cap + max from RS.Remotes.SendNotification (message, "ERROR")
+addThread(task.spawn(function()
+    local remotesFolder = RS:WaitForChild("Remotes", 60)
+    if not remotesFolder then return end
+    local sn = remotesFolder:WaitForChild("SendNotification", 90)
+    if not sn then return end
+    pcall(function()
+        if sn:IsA("RemoteEvent") or sn.ClassName == "UnreliableRemoteEvent" then
+            addConn(sn.OnClientEvent:Connect(onTotemSendNotification))
+        end
+    end)
 end))
 
 Win:ChatTab()
@@ -1967,9 +2312,13 @@ end)
 MiscTab:Button("🛑", "Stop All Loops", "Disconnects all connections and cancels all threads", C.red, function()
     states.autoAscend  = false
     states.autoSacrifice = false
+    states.autoTotem   = false
     states.autoManaToSP  = false
     pcall(function()
         if sacAutoToggle and sacAutoToggle.Set then sacAutoToggle.Set(false) end
+    end)
+    pcall(function()
+        if totemAutoToggle and totemAutoToggle.Set then totemAutoToggle.Set(false) end
     end)
     pcall(function()
         if manaToSpToggle and manaToSpToggle.Set then manaToSpToggle.Set(false) end
