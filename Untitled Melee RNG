@@ -234,6 +234,8 @@ local states = {
     totemKeepQty        = 0,
     totemDoneThisCycle  = 0,
     totemCapHitUnix     = nil, -- os.time() when server capped (starts 1h cycle lock)
+    totemSavedServerCap = nil, -- parsed/confirmed max; survives re-exec (see LS merge below)
+    totemCapFromServerNotify = false, -- "server confirmed" banner until CD ends
 }
 
 -- Upgrade names for save/load (must exist before saveSettings references upgradeSelected)
@@ -338,10 +340,7 @@ states.totemFilterColor = states.totemFilterColor == true
 states.totemRarityCapIdx = math.clamp(math.floor(tonumber(states.totemRarityCapIdx) or 1), 1, 9)
 states.totemKeepQty = math.clamp(math.floor(tonumber(states.totemKeepQty) or 0), 0, 999)
 states.totemDoneThisCycle = math.max(0, math.floor(tonumber(states.totemDoneThisCycle) or 0))
-do
-    local tcu = tonumber(states.totemCapHitUnix)
-    states.totemCapHitUnix = tcu -- nil if not a valid number
-end
+-- Totem CD/cap from LS applied in totem block (after TOTEM_CYCLE_SEC) + sanitize vs os.time()
 
 local function getAscendAfterTpCFrame()
     local x = tonumber(states.ascendAfterTpX) or DEF_ASCEND_TP_X
@@ -747,9 +746,34 @@ local TOTEM_AP_UPGRADE_NAME = "Totem Of Fortune Sacrifices"
 local TOTEM_CYCLE_SEC       = 3600
 local TOTEM_BASE_MAX        = 25
 local _totemApCache         = { t = 0, lvl = 0 }
--- Server-confirmed cap from RS.Remotes.SendNotification (message, "ERROR") when totem hits max
-local _totemServerMax          = nil
-local _totemCapViaNotification = false
+-- Server-confirmed cap: states.totemSavedServerCap (persisted) + SendNotification parse
+
+-- Totem CD keys are often missing from default `states` (nil fields), so merge loop skips them — load from LS here.
+-- Remaining CD = TOTEM_CYCLE_SEC - (os.time() - savedUnix). Roblox os.time() is real UTC wall clock: works after
+-- disconnect/rejoin as long as meleernq_settings.json was saved (Auto Save or cap triggered save).
+states.totemCapHitUnix = tonumber(LS.totemCapHitUnix)
+states.totemSavedServerCap = tonumber(LS.totemSavedServerCap)
+states.totemCapFromServerNotify = LS.totemCapFromServerNotify == true
+
+local function totemSanitizeLoadedCooldown()
+    local hit = states.totemCapHitUnix
+    if not hit then return end
+    local now = os.time()
+    local elapsed = now - hit
+    if elapsed < 0 then
+        states.totemCapHitUnix = nil
+        forceSave()
+        return
+    end
+    if elapsed >= TOTEM_CYCLE_SEC then
+        states.totemCapHitUnix = nil
+        states.totemDoneThisCycle = 0
+        states.totemCapFromServerNotify = false
+        states.totemSavedServerCap = nil
+        forceSave()
+    end
+end
+totemSanitizeLoadedCooldown()
 
 local function totemParseMaxFromNotification(msg)
     if type(msg) ~= "string" then return nil end
@@ -837,7 +861,7 @@ end
 
 local function getTotemMaxPerCycle()
     local calc = TOTEM_BASE_MAX + getTotemApLevel() * 5
-    local srv = tonumber(_totemServerMax)
+    local srv = tonumber(states.totemSavedServerCap)
     if srv and srv > 0 then
         return srv
     end
@@ -853,8 +877,8 @@ local function totemInCooldown()
     if elapsed >= TOTEM_CYCLE_SEC then
         states.totemCapHitUnix = nil
         states.totemDoneThisCycle = 0
-        _totemCapViaNotification = false
-        _totemServerMax = nil
+        states.totemCapFromServerNotify = false
+        states.totemSavedServerCap = nil
         if states.autoSave then saveSettings() else forceSave() end
         return false, 0
     end
@@ -883,7 +907,7 @@ local function updateTotemStatusLbl()
     local onCd, remain = totemInCooldown()
     local done = math.min(math.max(0, states.totemDoneThisCycle), maxC)
     local cdStr = onCd and formatTotemCd(remain) or "ready"
-    if _totemCapViaNotification and onCd then
+    if states.totemCapFromServerNotify and onCd then
         totemStatusLbl.Set(string.format("Cap hit | Max=%d (server confirmed) · CD: %s", maxC, cdStr))
     else
         totemStatusLbl.Set(string.format("Totem: %d/%d done | CD: %s | AP max: %d", done, maxC, cdStr, maxC))
@@ -900,17 +924,18 @@ local function onTotemSendNotification(message, msgType)
     local parsedMax = totemParseMaxFromNotification(message)
     if not parsedMax or parsedMax < 1 then return end
 
-    _totemServerMax = parsedMax
+    states.totemSavedServerCap = parsedMax
     _totemApCache.t = 0
 
     if not totemNotificationLooksLikeCap(message) then
+        saveSettings()
         updateTotemStatusLbl()
         return
     end
 
     states.totemDoneThisCycle = parsedMax
     states.totemCapHitUnix = os.time()
-    _totemCapViaNotification = true
+    states.totemCapFromServerNotify = true
     saveSettings()
     updateTotemStatusLbl()
 end
@@ -1010,6 +1035,11 @@ local function totemExecuteNext()
     if onCd then return false, "cd" end
     local maxC = getTotemMaxPerCycle()
     if states.totemDoneThisCycle >= maxC then
+        -- Orphan save: count at max but no hour anchor → was showing "CD: ready" while server still locks
+        if not states.totemCapHitUnix then
+            states.totemCapHitUnix = os.time()
+            saveSettings()
+        end
         return false, "local_cap"
     end
     refreshSacInventory()
@@ -1039,13 +1069,33 @@ local function totemExecuteNext()
     if res == false then
         states.totemDoneThisCycle = maxC
         states.totemCapHitUnix = os.time()
+        states.totemSavedServerCap = maxC
+        states.totemCapFromServerNotify = false
         saveSettings()
         return false, "server_cap"
     end
     states.totemDoneThisCycle = states.totemDoneThisCycle + 1
+    -- Last sacrifice of the cycle starts the same 1h window the server uses
+    if states.totemDoneThisCycle >= maxC then
+        states.totemCapHitUnix = os.time()
+    end
     saveSettings()
     return true, w.name
 end
+
+-- Fix JSON that has totemDoneThisCycle >= max but no totemCapHitUnix (never showed hourly CD)
+addThread(task.spawn(function()
+    task.wait(1.5)
+    if GEN ~= _G.MeleeRNG_Gen then return end
+    pcall(function()
+        local maxC = getTotemMaxPerCycle()
+        if states.totemDoneThisCycle >= maxC and not states.totemCapHitUnix then
+            states.totemCapHitUnix = os.time()
+            forceSave()
+            updateTotemStatusLbl()
+        end
+    end)
+end))
 
 SacTab:Button("🔄", "Refresh Inventory", "GetWeaponsInv:InvokeServer() — list + console print", C.accent, function()
     refreshSacInventory()
@@ -1092,6 +1142,7 @@ end)
 SacTab:Section("Totem of Fortune")
 SacTab:Label("Separate from Fountain: own color cap + keep below. Remote: TotemConfirm(weaponName). Luck ~Rank/10% per slot.")
 SacTab:Label("Cap: 25 + AP×5 until RS.Remotes.SendNotification sends ERROR with totem/fortune + max — then uses server max + 1h CD.")
+SacTab:Label("CD timer uses device os.time() vs saved start — time keeps passing offline; needs settings saved (Auto Save or after cap).")
 local totemFilterColorToggle = SacTab:Toggle("Totem: By color (OneIn)", "Totem only — OneIn ≤ tier below (not tied to Fountain filters) — saved", states.totemFilterColor, function(on)
     states.totemFilterColor = on == true
     saveSettings()
