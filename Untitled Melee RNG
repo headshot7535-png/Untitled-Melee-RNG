@@ -246,6 +246,7 @@ local UPGRADE_ORDER = {
 }
 
 local upgradeSelected = {}  -- [upgradeName] = bool — filled from LS below
+local upgradeLevelCap = {} -- [upgradeName] = max level (stop auto-buy when current >= cap); nil = no cap
 local _sacNameSelected = {} -- [weaponName] = bool — Sacrifice "By Name" picks (persisted)
 
 local walkSpeedVal   = 16
@@ -266,6 +267,12 @@ local function saveSettings()
             up[name] = upgradeSelected[name] == true
         end
         t.upgradeSelected = up
+        local ucaps = {}
+        for _, un in ipairs(UPGRADE_ORDER) do
+            local c = upgradeLevelCap[un]
+            if type(c) == "number" and c >= 1 then ucaps[un] = math.floor(c) end
+        end
+        t.upgradeLevelCap = ucaps
         t.hitboxSize = hitboxSize
         local sacNames = {}
         for name, on in pairs(_sacNameSelected) do
@@ -310,6 +317,12 @@ if type(LS.upgradeSelected) == "table" then
     for _, name in ipairs(UPGRADE_ORDER) do
         local v = LS.upgradeSelected[name]
         upgradeSelected[name] = (v == true or v == 1)
+    end
+end
+if type(LS.upgradeLevelCap) == "table" then
+    for _, name in ipairs(UPGRADE_ORDER) do
+        local v = tonumber(LS.upgradeLevelCap[name])
+        if v and v >= 1 then upgradeLevelCap[name] = math.floor(v) end
     end
 end
 if type(LS.sacNamesSelected) == "table" then
@@ -408,6 +421,8 @@ local function formatAscendTpSaved()
         tonumber(states.ascendAfterTpZ) or DEF_ASCEND_TP_Z)
 end
 
+-- Main chunk was hitting Luau's ~200 local register limit; UI + re-exec live in their own function.
+local SLbl = (function()
 -- ============================================================
 --  BUILD WINDOW  (tabs: Move → ESP → Areas → Upgrades → Sacrifice → Chat → Misc)
 -- ============================================================
@@ -496,6 +511,161 @@ local UPGRADE_PRICES = {
     ["Boss Spawn Chance"]      = function(p) return math.round(p^4) + 150 end,
 }
 
+-- Server SP cost if the game exposes it (more accurate than SharedConstants clone). Cleared after a buy.
+local _upgPriceCache = {}
+local UPG_PRICE_CACHE_TTL = 2.5
+local UPG_PRICE_REMOTE_NAMES = {
+    "GetUpgradePrice", "GetNextUpgradePrice", "GetUpgradeCost", "CalculateUpgradePrice",
+}
+
+local function upgInvalidatePriceCache()
+    _upgPriceCache = {}
+end
+
+-- GetUpgradeLevel sometimes returns a table/wrapped value; raw table breaks p^4 math → no price → row dropped from queue.
+local function upgCoerceLevel(raw)
+    if raw == nil or raw == false then return 0 end
+    if type(raw) == "number" then
+        if raw ~= raw or raw < 0 then return 0 end
+        return math.min(math.floor(raw), 1e9)
+    end
+    if type(raw) == "string" then
+        local n = tonumber(raw)
+        return n and upgCoerceLevel(n) or 0
+    end
+    if type(raw) == "table" then
+        local n = tonumber(raw[1])
+            or tonumber(raw.Level) or tonumber(raw.level)
+            or tonumber(raw.L) or tonumber(raw.Lvl) or tonumber(raw.Value) or tonumber(raw.value)
+        return n and upgCoerceLevel(n) or 0
+    end
+    return 0
+end
+
+local function upgReadUpgradeLevel(name)
+    local raw = nil
+    pcall(function() raw = invokeR("GetUpgradeLevel", name) end)
+    return upgCoerceLevel(raw)
+end
+
+local function upgCoercePrice(raw)
+    if type(raw) == "number" and raw == raw and raw > 0 and raw < 1e18 then return raw end
+    if type(raw) == "string" then
+        local n = tonumber(raw)
+        if n then return upgCoercePrice(n) end
+    end
+    if type(raw) == "table" then
+        local n = tonumber(raw[1])
+            or tonumber(raw.Price) or tonumber(raw.price)
+            or tonumber(raw.Cost) or tonumber(raw.cost)
+            or tonumber(raw.SP) or tonumber(raw.sp)
+        if n then return upgCoercePrice(n) end
+    end
+    return nil
+end
+
+-- Prefer (name, level) first — many handlers ignore `name` when level is omitted and return a wrong/default cost.
+local function upgTryRemotePrice(name, lvl)
+    local li = math.floor(tonumber(lvl) or 0)
+    if li < 0 then li = 0 end
+    for _, rn in ipairs(UPG_PRICE_REMOTE_NAMES) do
+        local v = nil
+        pcall(function() v = invokeR(rn, name, li) end)
+        local p = upgCoercePrice(v)
+        if p then return p end
+        pcall(function() v = invokeR(rn, name) end)
+        p = upgCoercePrice(v)
+        if p then return p end
+    end
+    return nil
+end
+
+--- Next-tier SP: cached remote (if any), else formula with pcall (lvl+1, then lvl fallback).
+local function upgGetNextPrice(name, lvl)
+    local now = os.clock()
+    local ck = name .. "#" .. tostring(lvl)
+    local ent = _upgPriceCache[ck]
+    if ent and (now - ent.t) < UPG_PRICE_CACHE_TTL then return ent.p end
+    local rp = upgTryRemotePrice(name, lvl)
+    if rp then
+        _upgPriceCache[ck] = { t = now, p = rp }
+        return rp
+    end
+    local priceFn = UPGRADE_PRICES[name]
+    if not priceFn then return nil end
+    local price = nil
+    local ok, p1 = pcall(priceFn, lvl + 1)
+    if ok and type(p1) == "number" and p1 == p1 and p1 > 0 and p1 < math.huge then price = p1 end
+    if not price then
+        local ok2, p2 = pcall(priceFn, lvl)
+        if ok2 and type(p2) == "number" and p2 == p2 and p2 > 0 and p2 < math.huge then price = p2 end
+    end
+    if price then _upgPriceCache[ck] = { t = now, p = price } end
+    return price
+end
+
+--- All toggles ON in UI (`upgradeSelected`) + under level cap; sorted by next-tier SP cost (cheapest first).
+-- Enemy Limit uses p^1.1; most others use p^4 — at high levels Enemy Limit is often cheapest by formula alone.
+local function upgBuildSortedCandidates()
+    local list = {}
+    for _, name in ipairs(UPGRADE_ORDER) do
+        if upgradeSelected[name] == true then
+            local lvl = upgReadUpgradeLevel(name)
+            local capN = upgradeLevelCap[name]
+            if type(capN) == "number" and capN >= 1 and lvl >= capN then continue end
+            local price = upgGetNextPrice(name, lvl)
+            if type(price) == "number" and price == price and price < math.huge then
+                list[#list + 1] = { name = name, price = price, lvl = lvl }
+            end
+        end
+    end
+    table.sort(list, function(a, b)
+        if a.price ~= b.price then return a.price < b.price end
+        return a.name < b.name
+    end)
+    return list
+end
+
+--- Every toggle ON, in UI order: next SP price, or "at cap", or "?" if price unknown.
+local function upgFormatAllToggled(candidates)
+    local priceByName = {}
+    for _, r in ipairs(candidates) do
+        priceByName[r.name] = r.price
+    end
+    local parts = {}
+    for _, name in ipairs(UPGRADE_ORDER) do
+        if upgradeSelected[name] ~= true then continue end
+        local p = priceByName[name]
+        if type(p) == "number" and p == p and p < math.huge then
+            parts[#parts + 1] = string.format("%s:%.0f", name, p)
+        else
+            local lvl = upgReadUpgradeLevel(name)
+            local capN = upgradeLevelCap[name]
+            if type(capN) == "number" and capN >= 1 and lvl >= capN then
+                parts[#parts + 1] = string.format("%s:cap L%d", name, lvl)
+            else
+                parts[#parts + 1] = name .. ":?"
+            end
+        end
+    end
+    if #parts == 0 then return "—" end
+    return table.concat(parts, " · ")
+end
+
+local function upgCountSelectedToggles()
+    local n = 0
+    for _, name in ipairs(UPGRADE_ORDER) do
+        if upgradeSelected[name] == true then n = n + 1 end
+    end
+    return n
+end
+
+local function upgFormatSp(sp)
+    local n = tonumber(sp)
+    if not n then return tostring(sp) end
+    return tostring(math.floor(n + 1e-6))
+end
+
 local upgStatusLbl  = UpgTab:Label("Status: OFF")
 local upgInfoLbl    = UpgTab:Label("SP: — | Next: —")
 
@@ -511,12 +681,21 @@ UpgTab:Button("⚡", "Toggle Auto Upgrade", "Start/stop the auto upgrade loop (s
     saveSettings()
 end)
 
-UpgTab:Label("Buys checked upgrades when SP is sufficient. Price from SharedConstants.Upgrades.")
+UpgTab:Label("Every toggle ON is used. Sort = lowest next SP (server price remote if present, else formula). Enemy Limit scales ~p^1.1 vs p^4 — often cheapest late-game.")
 UpgTab:Section("Select Upgrades to Auto-Buy")
+UpgTab:Label("Optional level cap under each row: auto-buy stops when current level ≥ cap (empty = no limit).")
 
 -- Build upgrade selection list using NexusLib toggles
 local upgToggles = {}
+local upgCapInputs = {}
 
+local function parseUpgradeCapInput(text)
+    local s = tostring(text or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if s == "" then return nil end
+    local n = tonumber(s)
+    if not n or n < 1 then return nil end
+    return math.min(math.floor(n), 999999)
+end
 
 -- Build toggles immediately with no remote calls (instant, no blocking)
 -- Level/price info is fetched async and shown in the status label
@@ -524,10 +703,25 @@ for _, name in ipairs(UPGRADE_ORDER) do
     local isSel = upgradeSelected[name] == true
     local n2    = name
     local t = UpgTab:Toggle(name, "Auto-buy when SP is sufficient", isSel, function(on)
-        upgradeSelected[n2] = on
+        upgradeSelected[n2] = (on == true)
         saveSettings()
     end)
     upgToggles[name] = t
+    local capDefault = ""
+    if type(upgradeLevelCap[n2]) == "number" and upgradeLevelCap[n2] >= 1 then
+        capDefault = tostring(upgradeLevelCap[n2])
+    end
+    local inp = UpgTab:Input(
+        "Level cap",
+        n2 .. " — stop when level reaches this number; leave empty for no cap (saved)",
+        "no cap",
+        capDefault,
+        function(txt)
+            upgradeLevelCap[n2] = parseUpgradeCapInput(txt)
+            saveSettings()
+        end
+    )
+    upgCapInputs[n2] = inp
 end
 
 UpgTab:Button("✅", "Select All / None", "Toggle all upgrades on or off", C.green, function()
@@ -544,26 +738,66 @@ UpgTab:Button("✅", "Select All / None", "Toggle all upgrades on or off", C.gre
     saveSettings()
 end)
 
+UpgTab:Section("Live status (updates every 5s)")
+local upgLevelLbls = {}
+for _, un in ipairs(UPGRADE_ORDER) do
+    upgLevelLbls[un] = UpgTab:Label(un .. ": …")
+end
+
+local function upgFormatLiveRowText(name)
+    local lvl = upgReadUpgradeLevel(name)
+    local capN = upgradeLevelCap[name]
+    local capSet = type(capN) == "number" and capN >= 1
+    local atCap = capSet and lvl >= capN
+    local price = upgGetNextPrice(name, lvl)
+    local mid
+    if atCap then
+        mid = string.format("Lv %d · AT CAP (%d)", lvl, capN)
+    elseif type(price) == "number" and price == price and price < math.huge then
+        mid = string.format("Lv %d · next %.0f SP", lvl, price)
+    else
+        mid = string.format("Lv %d · next ? SP", lvl)
+    end
+    local tail = (capSet and not atCap) and string.format(" · stop @%d", capN) or ""
+    return name .. " · " .. mid .. tail
+end
+
+addThread(task.spawn(function()
+    task.wait(2)
+    while true do
+        if GEN ~= _G.MeleeRNG_Gen then break end
+        for _, un in ipairs(UPGRADE_ORDER) do
+            local lbl = upgLevelLbls[un]
+            if lbl and lbl.Set then
+                pcall(function() lbl.Set(upgFormatLiveRowText(un)) end)
+            end
+        end
+        task.wait(5)
+    end
+end))
+
 -- Async level info — updates status label without blocking toggle creation
 addThread(task.spawn(function()
     task.wait(2)  -- wait for game to load
     while true do
         if GEN ~= _G.MeleeRNG_Gen then break end
-        if not states.autoUpgradeOn then task.wait(2); continue end
         local sp = getSP()
-        local nextName, nextPrice = "none", math.huge
-        for _, name in ipairs(UPGRADE_ORDER) do
-            if upgradeSelected[name] then
-                local lvl = 0
-                pcall(function() lvl = invokeR("GetUpgradeLevel", name) or 0 end)
-                local priceFn = UPGRADE_PRICES[name]
-                local price   = priceFn and priceFn(lvl+1) or math.huge
-                if price < nextPrice then nextPrice = price; nextName = name end
-            end
+        local candidates = upgBuildSortedCandidates()
+        if not states.autoUpgradeOn then
+            upgInfoLbl.Set(string.format("SP: %s | %d on | auto OFF | On: %s",
+                upgFormatSp(sp), upgCountSelectedToggles(), upgFormatAllToggled(candidates)))
+            task.wait(2)
+            continue
         end
-        upgInfoLbl.Set(string.format("SP: %s | Next: %s (%s SP)",
-            tostring(sp), nextName,
-            nextPrice == math.huge and "?" or tostring(math.floor(nextPrice))))
+        local nextName, nextPrice = "none", math.huge
+        if #candidates > 0 then
+            nextName = candidates[1].name
+            nextPrice = candidates[1].price
+        end
+        upgInfoLbl.Set(string.format("SP: %s | %d on | 1st:%s (%s SP) | On: %s",
+            upgFormatSp(sp), upgCountSelectedToggles(), nextName,
+            nextPrice == math.huge and "?" or tostring(math.floor(nextPrice)),
+            upgFormatAllToggled(candidates)))
         task.wait(3)
     end
 end))
@@ -579,50 +813,35 @@ addThread(task.spawn(function()
         local sp = getSP()
         local bought = false
 
-        -- Fetch current levels and unlocked status once per cycle
-        local unlocked = {}
-        pcall(function()
-            local u = invokeR("GetUnlockedUpgrades")
-            if type(u) == "table" then unlocked = u end
-        end)
-
-        for _, name in ipairs(UPGRADE_ORDER) do
-            if not upgradeSelected[name] then continue end
-            if not unlocked[name] then continue end
-
-            local lvl = 0
-            pcall(function() lvl = invokeR("GetUpgradeLevel", name) or 0 end)
-
-            local priceFn = UPGRADE_PRICES[name]
-            local price   = priceFn and priceFn(lvl + 1) or math.huge
-
-            if sp >= price then
+        local candidates = upgBuildSortedCandidates()
+        local spNum = tonumber(sp) or 0
+        for _, row in ipairs(candidates) do
+            local name, price, lvl = row.name, row.price, row.lvl
+            if spNum >= price then
                 local ok = invokeR("BuyUpgrade", name)
                 if ok then
                     bought = true
-                    sp = getCachedStat("SP")  -- refresh SP after purchase
-                    upgStatusLbl.Set(string.format("✓ Bought: %s Lv%d→Lv%d | SP: %s", name, lvl, lvl+1, tostring(sp)))
+                    upgInvalidatePriceCache()
+                    sp = getCachedStat("SP")
+                    spNum = tonumber(sp) or 0
+                    upgStatusLbl.Set(string.format("✓ Bought: %s Lv%d→Lv%d | SP: %s", name, lvl, lvl + 1, upgFormatSp(sp)))
                     SLbl.Text = "⬆️ Upgraded: " .. name
-                    -- Invalidate stat cache so SP reflects the deduction
                     _cachedStats["SP"] = nil
+                    break
                 end
+                -- Server rejected; try next cheapest this tick (if any)
             end
         end
 
         if not bought then
-            -- Show next affordable upgrade
             local nextName, nextPrice = "none", math.huge
-            for _, name in ipairs(UPGRADE_ORDER) do
-                if upgradeSelected[name] and unlocked[name] then
-                    local lvl = 0
-                    pcall(function() lvl = invokeR("GetUpgradeLevel", name) or 0 end)
-                    local priceFn = UPGRADE_PRICES[name]
-                    local price   = priceFn and priceFn(lvl+1) or math.huge
-                    if price < nextPrice then nextPrice = price; nextName = name end
-                end
+            if #candidates > 0 then
+                nextName = candidates[1].name
+                nextPrice = candidates[1].price
             end
-            upgStatusLbl.Set(string.format("⏳ Next: %s | Need %d SP | Have %d",
-                nextName, nextPrice == math.huge and 0 or nextPrice, sp))
+            upgStatusLbl.Set(string.format("⏳ Next:%s (%d SP) | Have %s | On:%s",
+                nextName, nextPrice == math.huge and 0 or math.floor(nextPrice), upgFormatSp(sp),
+                upgFormatAllToggled(candidates)))
         end
 
     end
@@ -2310,7 +2529,7 @@ MiscTab:Button("📊", "Print Upgrade Levels", "Fetches all upgrade levels via G
     local upgrades = invokeR("GetUnlockedUpgrades")
     if not upgrades then SLbl.Text = "⚠ GetUnlockedUpgrades returned nil"; return end
     for _, name in ipairs(UPGRADE_NAMES) do
-        local level = invokeR("GetUpgradeLevel", name) or 0
+        local level = upgReadUpgradeLevel(name)
         local val   = invokeR("GetUpgradeValue", name) or 0
         print(string.format("[MeleeRNG] %-30s  Lv%d  Value: %s", name, level, tostring(val)))
     end
@@ -2462,6 +2681,9 @@ do
 
     _G.MeleeRNG_ArmReexecQueue = armQueue
 end
+
+return SLbl
+end)()
 
 -- ============================================================
 --  DONE
