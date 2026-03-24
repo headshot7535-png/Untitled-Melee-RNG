@@ -1,8 +1,5 @@
 
-
--- Preset buttons need Slider:Set — use local "NexusLib.lua" (patched copy next to this script) or update the GitHub Nexuslib repo to match Downloads NexusLib.lua
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
--- Full script URL (Auto Re-Execute: executor queue_on_teleport — same idea as ANIPIXELS GUI v5.0)
 local SCRIPT_URL     = "https://raw.githubusercontent.com/headshot7535-png/Untitled-Melee-RNG/main/Untitled%20Melee%20RNG"
 
 -- ── Load NexusLib ─────────────────────────────────────────────
