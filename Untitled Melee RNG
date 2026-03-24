@@ -227,15 +227,13 @@ local states = {
     -- Totem of Fortune — TotemConfirm(weaponName); cap 25 + AP level×5; 1h CD when server returns false
     -- Filters are separate from Fountain sacrifice (own color cap + keep qty)
     autoTotem           = false,
-    totemFilterColor    = false,  -- OneIn ≤ totemRarityCapIdx (independent of Fountain)
+    totemFilterColor    = false,  -- only weapons in selected OneIn *band* (not “up through”; Fountain stays ≤ cap)
     totemRarityCapIdx   = 1,
     totemKeepQty        = 0,
     totemDoneThisCycle  = 0,
     totemCapHitUnix     = nil, -- os.time() when server capped (starts 1h cycle lock)
     totemSavedServerCap = nil, -- parsed/confirmed max; survives re-exec (see LS merge below)
     totemCapFromServerNotify = false, -- "server confirmed" banner until CD ends
-    -- OFF by default: game accepts TotemConfirm from your spot; enable only if you want a client-side distance lock
-    totemProxDistanceGate   = false,
     -- Totem color = OneIn range; ticked rows = which names in that range may be sacrificed (like Cobalt)
     totemOnlyTickedNames    = false,
 }
@@ -351,7 +349,6 @@ states.ascendAfterTpY  = tonumber(states.ascendAfterTpY) or DEF_ASCEND_TP_Y
 states.ascendAfterTpZ  = tonumber(states.ascendAfterTpZ) or DEF_ASCEND_TP_Z
 
 states.autoTotem = states.autoTotem == true
-states.totemProxDistanceGate = states.totemProxDistanceGate == true
 states.totemOnlyTickedNames = states.totemOnlyTickedNames == true
 states.totemFilterColor = states.totemFilterColor == true
 states.totemRarityCapIdx = math.clamp(math.floor(tonumber(states.totemRarityCapIdx) or 1), 1, 9)
@@ -947,6 +944,23 @@ for i, t in ipairs(SAC_TIERS) do
     SAC_DROPDOWN_LABELS[i] = string.format("%s %s · sacrifice if OneIn≤%s", t.emoji, t.name, tostring(t.maxOneIn))
 end
 
+-- Totem: exact tier band only (Fountain still uses “up through” caps above).
+local SAC_TOTEM_DROPDOWN_LABELS = {}
+for i, t in ipairs(SAC_TIERS) do
+    if i == 1 then
+        SAC_TOTEM_DROPDOWN_LABELS[i] = string.format("%s %s · Totem only: OneIn ≤ %s", t.emoji, t.name, tostring(t.maxOneIn))
+    else
+        local prev = SAC_TIERS[i - 1].maxOneIn
+        SAC_TOTEM_DROPDOWN_LABELS[i] = string.format(
+            "%s %s · Totem only: OneIn > %s and ≤ %s",
+            t.emoji,
+            t.name,
+            tostring(prev),
+            tostring(t.maxOneIn)
+        )
+    end
+end
+
 local function sacAnyFilterOn()
     return states.sacFilterColor or states.sacFilterName
 end
@@ -970,7 +984,7 @@ local TOTEM_CYCLE_SEC       = 3600
 local TOTEM_BASE_MAX        = 25
 local TOTEM_ACTION_DELAY_SEC = 30 -- one-time settle delay right after hourly CD ends
 local TOTEM_REJECT_BACKOFF_SEC = 45 -- after server false: don't spam InvokeServer (fewer red toasts)
-local TOTEM_MIN_INVOKE_GAP_SEC = 6 -- Cobalt is manual (~slow); auto every 3s can trip server / spam red ERROR
+local TOTEM_MIN_INVOKE_GAP_SEC = 6 -- Cobalt is manual (~slow); fast auto can trip server / spam red ERROR
 local TOTEM_SKIP_AFTER_REJECT_SEC = 180 -- server false for this weapon name: try other picks for a few minutes
 local TOTEM_CONFIRM_WINDOW_SEC = 1.2 -- only count if no red ERROR arrives in this window
 local _totemLastConfirmClock = 0
@@ -978,9 +992,6 @@ local _totemRejectUntil = {} -- [weaponName] = os.clock() until skip expires
 local _totemRoundRobin = 1 -- cycles through all Totem-color weapons; each InvokeServer uses that row's real name
 local _totemPendingToken = 0 -- increments per invoke; delayed confirmer checks latest token
 local _totemPendingReject = false
--- Use distance to nearest BasePart on the machine (prompt is often far from PrimaryPart).
-local TOTEM_NEAR_MACHINE_STUDS = 120
-local TOTEM_MACHINE_NAMES      = { "Totem Of Fortune", "Totem of Fortune", "Fortune Totem" }
 local _totemApCache         = { t = 0, lvl = 0 }
 local _totemNextActionAt    = 0   -- os.clock() time gate (session only)
 local _totemActionsThisRun  = 0   -- number of successful totem sacrifices this run
@@ -1135,58 +1146,15 @@ end
 
 local function totemWeaponPassesColor(w)
     if not states.totemFilterColor then return false end
-    local cap = sacCapOneInForDropdownIdx(states.totemRarityCapIdx)
+    local idx = math.clamp(math.floor(tonumber(states.totemRarityCapIdx) or 1), 1, #SAC_TIERS)
     local oi = tonumber(w.oneIn)
     if not oi or oi == math.huge then return false end
-    return oi <= cap
-end
-
-local function findTotemFortuneMachineInstance()
-    local machines = workspace:FindFirstChild("Machines")
-    if machines then
-        for _, n in ipairs(TOTEM_MACHINE_NAMES) do
-            local m = machines:FindFirstChild(n, true)
-            if m and m.Parent then return m end
-        end
-        for _, ch in ipairs(machines:GetDescendants()) do
-            if ch:IsA("Model") then
-                local low = string.lower(ch.Name)
-                if string.find(low, "totem", 1, true) and string.find(low, "fortune", 1, true) then
-                    return ch
-                end
-            end
-        end
+    local maxCap = SAC_TIERS[idx].maxOneIn
+    if idx == 1 then
+        return oi > 0 and oi <= maxCap
     end
-    return nil
-end
-
-local function hrpWithinStudsOfInstance(inst, maxStuds)
-    local root = getRoot()
-    if not root or not inst then return false end
-    local rp = root.Position
-    maxStuds = tonumber(maxStuds) or TOTEM_NEAR_MACHINE_STUDS
-    if inst:IsA("BasePart") then
-        return (rp - inst.Position).Magnitude <= maxStuds
-    end
-    local best = math.huge
-    for _, d in ipairs(inst:GetDescendants()) do
-        if d:IsA("BasePart") then
-            local mag = (rp - d.Position).Magnitude
-            if mag < best then best = mag end
-        end
-    end
-    if best <= maxStuds then return true end
-    if inst:IsA("Model") and inst.PrimaryPart then
-        return (rp - inst.PrimaryPart.Position).Magnitude <= maxStuds
-    end
-    return false
-end
-
-local function canTotemConfirmByProximity()
-    if not states.totemProxDistanceGate then return true end
-    local inst = findTotemFortuneMachineInstance()
-    if not inst then return true end
-    return hrpWithinStudsOfInstance(inst, TOTEM_NEAR_MACHINE_STUDS)
+    local minCap = SAC_TIERS[idx - 1].maxOneIn
+    return oi > minCap and oi <= maxCap
 end
 
 local function formatTotemCd(secs)
@@ -1394,9 +1362,6 @@ local function totemExecuteNext()
     if gapLeft > 0 then
         return false, "throttle"
     end
-    if not canTotemConfirmByProximity() then
-        return false, "far"
-    end
     local onCd = select(1, totemInCooldown())
     if onCd then return false, "cd" end
     local maxC = getTotemMaxPerCycle()
@@ -1544,19 +1509,18 @@ local sacKeepSlider = SacTab:Slider("Always keep qty", "Per weapon type: keep at
     states.sacKeepQty = math.floor(v); saveSettings()
 end)
 
-local sacAutoToggle = SacTab:Toggle("Toggle Auto Sacrifice", "Every 3s: inventory, filters, FountainSacrifice — saved", states.autoSacrifice, function(on)
+local sacAutoToggle = SacTab:Toggle("Toggle Auto Sacrifice", "Every 1.5s: inventory, filters, FountainSacrifice — saved", states.autoSacrifice, function(on)
     states.autoSacrifice = on == true
     saveSettings()
-    sacStatusLbl.Set(on and "Auto: ON · every 3s" or "Auto: OFF · idle")
+    sacStatusLbl.Set(on and "Auto: ON · every 1.5s" or "Auto: OFF · idle")
     SLbl.Text = on and "Auto Sacrifice ON" or "Auto Sacrifice OFF"
 end)
 
 SacTab:Section("Totem of Fortune")
 SacTab:Label("Separate from Fountain: own color cap + keep below. Remote: TotemConfirm(weaponName). Luck ~Rank/10% per slot.")
-SacTab:Label("Distance gate is optional (default OFF). Turn it ON only if you want auto totem blocked when far from the machine.")
 SacTab:Label("Cap: 25 + AP×5. ERROR notifications update max; 1h CD starts only after local done reaches max (prevents stale text resets).")
 SacTab:Label("CD timer uses device os.time() vs saved start — time keeps passing offline; needs settings saved (Auto Save or after cap).")
-local totemFilterColorToggle = SacTab:Toggle("Totem: By color (OneIn)", "Totem only — OneIn ≤ tier below (not tied to Fountain filters) — saved", states.totemFilterColor, function(on)
+local totemFilterColorToggle = SacTab:Toggle("Totem: By color (OneIn)", "Totem only — weapons in that tier’s OneIn band only (not “up through”) — saved", states.totemFilterColor, function(on)
     states.totemFilterColor = on == true
     saveSettings()
 end)
@@ -1565,25 +1529,21 @@ local totemOnlyTickedToggle = SacTab:Toggle("Totem: only ✓ list names", "ON = 
     saveSettings()
 end)
 local totemRarityDropdown = SacTab:Dropdown(
-    "Totem — sacrifice up through this color",
-    "Max OneIn for Totem picks only (saved). Same tier table as Fountain.",
-    SAC_DROPDOWN_LABELS,
+    "Totem — only this color tier",
+    "Totem matches OneIn inside this band only. Fountain dropdown above still uses “up through” caps.",
+    SAC_TOTEM_DROPDOWN_LABELS,
     math.clamp(states.totemRarityCapIdx, 1, #SAC_TIERS),
     function(_, _, idx)
         states.totemRarityCapIdx = math.clamp(math.floor(tonumber(idx) or 1), 1, #SAC_TIERS)
         saveSettings()
     end
 )
-SacTab:Label("Totem tiers (OneIn): ⬜≤5 · 🟩≤50 · 🟦≤200 · 🟣≤5k · 🟠≤50k · 🩷≤1M · 🟤≤7M · 🩵≤11M · ⬛≤99M")
+SacTab:Label("Totem bands: Common ≤5 · Uncommon (5,50] · Rare (50,200] · Epic (200,5k] · Leg (5k,50k] · Mythic (50k,1M] · Galactic (1M,7M] · Godly (7M,11M] · Omni (11M,99M]")
 local totemKeepSlider = SacTab:Slider("Totem — always keep qty", "Per weapon type for Totem only; independent of Fountain keep (saved)", {
     min = 0, max = 999, default = math.clamp(states.totemKeepQty, 0, 999),
     format = function(v) return "keep " .. tostring(math.floor(v)) end,
 }, function(v)
     states.totemKeepQty = math.floor(v)
-    saveSettings()
-end)
-local totemProxGateToggle = SacTab:Toggle("Totem: distance gate (optional)", "OFF = same as opening totem UI anywhere. ON = client blocks until near machine model — saved", states.totemProxDistanceGate, function(on)
-    states.totemProxDistanceGate = on == true
     saveSettings()
 end)
 SacTab:Label("Totem color = OneIn range (e.g. all Galactic). Auto cycles those weapons and calls TotemConfirm(each real name). Optional: only ✓ list names to narrow further.")
@@ -1606,7 +1566,6 @@ SacTab:Button("🕯️", "Totem: sacrifice 1 (next in color)", "Cycles all weapo
             local_cap = "At cycle cap (wait CD or refresh)",
             no_weapon = "No weapon (enable Totem By color or refresh inv)",
             no_totem_tick = "Tick weapon(s) in the list that pass Totem color — or turn off Totem only ✓ names",
-            far = "Too far from Totem Of Fortune — stand at the machine (or turn off require-near)",
             server_reject = "Server rejected this weapon — skipped 3m; try others (Cobalt name may differ from auto pick)",
             throttle = "Wait a few seconds between totem calls (anti-spam)",
             fail = "TotemConfirm error (remote missing or InvokeServer threw)",
@@ -1615,7 +1574,7 @@ SacTab:Button("🕯️", "Totem: sacrifice 1 (next in color)", "Cycles all weapo
         SLbl.Text = "Totem: " .. msg
     end
 end)
-local totemAutoToggle = SacTab:Toggle("Auto Totem", "Every 3s: Totem color cap + keep, highest Rank, TotemConfirm — saved", states.autoTotem, function(on)
+local totemAutoToggle = SacTab:Toggle("Auto Totem", "Every 1.5s: Totem color cap + keep, highest Rank, TotemConfirm — saved", states.autoTotem, function(on)
     states.autoTotem = on == true
     saveSettings()
     SLbl.Text = on and "Auto Totem ON" or "Auto Totem OFF"
@@ -1693,10 +1652,7 @@ task.defer(function()
         if totemKeepSlider and totemKeepSlider.Set then
             totemKeepSlider.Set(math.clamp(states.totemKeepQty, 0, 999), true)
         end
-        if totemProxGateToggle and totemProxGateToggle.Set then
-            totemProxGateToggle.Set(states.totemProxDistanceGate)
-        end
-        sacStatusLbl.Set(states.autoSacrifice and "Auto: ON · every 3s" or "Auto: OFF · idle")
+        sacStatusLbl.Set(states.autoSacrifice and "Auto: ON · every 1.5s" or "Auto: OFF · idle")
         updateTotemStatusLbl()
     end)
 end)
@@ -1711,7 +1667,7 @@ addThread(task.spawn(function()
     while true do
         if GEN ~= _G.MeleeRNG_Gen then break end
         if not states.autoSacrifice then task.wait(1); continue end
-        task.wait(3)
+        task.wait(1.5)
         if not sacAnyFilterOn() then
             sacStatusLbl.Set("Auto: ON — enable ≥1 filter")
             continue
@@ -1758,7 +1714,7 @@ addThread(task.spawn(function()
                 end
             end
         end)
-        sacStatusLbl.Set(string.format("Auto: ON · sacrificed %d types · skipped %d · next 3s", sacrificed, skipped))
+        sacStatusLbl.Set(string.format("Auto: ON · sacrificed %d types · skipped %d · next 1.5s", sacrificed, skipped))
     end
 end))
 
@@ -1774,7 +1730,7 @@ addThread(task.spawn(function()
     while true do
         if GEN ~= _G.MeleeRNG_Gen then break end
         if not states.autoTotem then task.wait(1); continue end
-        task.wait(3)
+        task.wait(1.5)
         if not states.totemFilterColor then
             if totemLastLbl then totemLastLbl.Set("Totem auto: turn on Totem: By color (OneIn)") end
             continue
@@ -1783,7 +1739,7 @@ addThread(task.spawn(function()
         if totemLastLbl then
             if ok then
                 totemLastLbl.Set("Totem last: " .. tostring(why))
-            elseif why == "no_weapon" or why == "no_totem_tick" or why == "fail" or why == "wait" or why == "server_reject" or why == "far" or why == "throttle" then
+            elseif why == "no_weapon" or why == "no_totem_tick" or why == "fail" or why == "wait" or why == "server_reject" or why == "throttle" then
                 totemLastLbl.Set("Totem auto: " .. tostring(why))
             end
         end
