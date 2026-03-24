@@ -964,7 +964,11 @@ end
 local TOTEM_AP_UPGRADE_NAME = "Totem Of Fortune Sacrifices"
 local TOTEM_CYCLE_SEC       = 3600
 local TOTEM_BASE_MAX        = 25
+local TOTEM_ACTION_DELAY_SEC = 30 -- one-time settle delay right after hourly CD ends
 local _totemApCache         = { t = 0, lvl = 0 }
+local _totemNextActionAt    = 0   -- os.clock() time gate (session only)
+local _totemActionsThisRun  = 0   -- number of successful totem sacrifices this run
+local _totemWasOnCooldown   = (states.totemCapHitUnix ~= nil)
 -- Server-confirmed cap: states.totemSavedServerCap (persisted) + SendNotification parse
 
 -- Totem CD keys are often missing from default `states` (nil fields), so merge loop skips them — load from LS here.
@@ -1090,7 +1094,10 @@ end
 --- Returns isOnCooldown, secondsRemaining (0 if not on CD). Clears cycle when CD elapsed.
 local function totemInCooldown()
     local hit = states.totemCapHitUnix
-    if not hit then return false, 0 end
+    if not hit then
+        _totemWasOnCooldown = false
+        return false, 0
+    end
     local now = os.time()
     local elapsed = now - hit
     if elapsed >= TOTEM_CYCLE_SEC then
@@ -1098,9 +1105,15 @@ local function totemInCooldown()
         states.totemDoneThisCycle = 0
         states.totemCapFromServerNotify = false
         states.totemSavedServerCap = nil
+        -- CD just reached zero: wait a bit so stale cap text / delayed notifications don't instantly re-lock.
+        if _totemWasOnCooldown then
+            _totemNextActionAt = math.max(_totemNextActionAt, os.clock() + TOTEM_ACTION_DELAY_SEC)
+        end
+        _totemWasOnCooldown = false
         if states.autoSave then saveSettings() else forceSave() end
         return false, 0
     end
+    _totemWasOnCooldown = true
     return true, TOTEM_CYCLE_SEC - elapsed
 end
 
@@ -1119,6 +1132,12 @@ local function formatTotemCd(secs)
     return string.format("%dm%ds", m, s)
 end
 
+local function totemActionWaitRemaining()
+    local remain = _totemNextActionAt - os.clock()
+    if remain <= 0 then return 0 end
+    return math.floor(remain + 0.5)
+end
+
 local totemStatusLbl
 local function updateTotemStatusLbl()
     if not totemStatusLbl then return end
@@ -1126,11 +1145,25 @@ local function updateTotemStatusLbl()
     local onCd, remain = totemInCooldown()
     local done = math.min(math.max(0, states.totemDoneThisCycle), maxC)
     local cdStr = onCd and formatTotemCd(remain) or "ready"
+    local waitSec = totemActionWaitRemaining()
     if states.totemCapFromServerNotify and onCd then
-        totemStatusLbl.Set(string.format("Cap hit | Max=%d (server confirmed) · CD: %s", maxC, cdStr))
+        totemStatusLbl.Set(string.format("Cap hit | Max=%d (server confirmed) · CD: %s | this run: %d", maxC, cdStr, _totemActionsThisRun))
+    elseif waitSec > 0 then
+        totemStatusLbl.Set(string.format("Totem: %d/%d done | wait: %ds | this run: %d | AP max: %d", done, maxC, waitSec, _totemActionsThisRun, maxC))
     else
-        totemStatusLbl.Set(string.format("Totem: %d/%d done | CD: %s | AP max: %d", done, maxC, cdStr, maxC))
+        totemStatusLbl.Set(string.format("Totem: %d/%d done | CD: %s | this run: %d | AP max: %d", done, maxC, cdStr, _totemActionsThisRun, maxC))
     end
+end
+
+local function totemEligibleCountCached()
+    local keep = math.max(0, math.floor(tonumber(states.totemKeepQty) or 0))
+    local n = 0
+    for _, w in ipairs(_sacInv) do
+        if totemWeaponPassesColor(w) and w.qty > keep then
+            n = n + 1
+        end
+    end
+    return n
 end
 
 local function onTotemSendNotification(message, msgType)
@@ -1152,8 +1185,25 @@ local function onTotemSendNotification(message, msgType)
         return
     end
 
-    states.totemDoneThisCycle = parsedMax
-    states.totemCapHitUnix = os.time()
+    -- Ignore stale/replayed cap text until our local progress reached cap.
+    -- This prevents CD from restarting early at 0:00 when old text re-fires.
+    local localDone = math.max(0, math.floor(tonumber(states.totemDoneThisCycle) or 0))
+    if localDone < parsedMax then
+        local eligibleNow = totemEligibleCountCached()
+        if eligibleNow > 0 then
+            updateTotemStatusLbl()
+            return
+        end
+        -- Even if no eligible weapon right now, do not start hourly CD from text alone.
+        -- User can refresh/retarget filters; CD starts only after true cap usage.
+        updateTotemStatusLbl()
+        return
+    end
+
+    states.totemDoneThisCycle = math.max(localDone, parsedMax)
+    if not states.totemCapHitUnix then
+        states.totemCapHitUnix = os.time()
+    end
     states.totemCapFromServerNotify = true
     saveSettings()
     updateTotemStatusLbl()
@@ -1250,6 +1300,9 @@ end
 
 --- One TotemConfirm call: best Rank among color-filtered weapons (respects keep qty).
 local function totemExecuteNext()
+    if totemActionWaitRemaining() > 0 then
+        return false, "wait"
+    end
     local onCd = select(1, totemInCooldown())
     if onCd then return false, "cd" end
     local maxC = getTotemMaxPerCycle()
@@ -1284,19 +1337,19 @@ local function totemExecuteNext()
     if not invokeOk then
         return false, "fail"
     end
-    -- Server returns false = at cap / rejected; nil or anything else = success (many games return nothing)
+    -- Server returns false = rejected (cap or transient); don't force-start 1h CD from this alone.
     if res == false then
-        states.totemDoneThisCycle = maxC
-        states.totemCapHitUnix = os.time()
         states.totemSavedServerCap = maxC
-        states.totemCapFromServerNotify = false
         saveSettings()
-        return false, "server_cap"
+        return false, "server_reject"
     end
     states.totemDoneThisCycle = states.totemDoneThisCycle + 1
+    _totemActionsThisRun = _totemActionsThisRun + 1
     -- Last sacrifice of the cycle starts the same 1h window the server uses
     if states.totemDoneThisCycle >= maxC then
-        states.totemCapHitUnix = os.time()
+        if not states.totemCapHitUnix then
+            states.totemCapHitUnix = os.time()
+        end
     end
     saveSettings()
     return true, w.name
@@ -1360,7 +1413,7 @@ end)
 
 SacTab:Section("Totem of Fortune")
 SacTab:Label("Separate from Fountain: own color cap + keep below. Remote: TotemConfirm(weaponName). Luck ~Rank/10% per slot.")
-SacTab:Label("Cap: 25 + AP×5 until RS.Remotes.SendNotification sends ERROR with totem/fortune + max — then uses server max + 1h CD.")
+SacTab:Label("Cap: 25 + AP×5. ERROR notifications update max; 1h CD starts only after local done reaches max (prevents stale text resets).")
 SacTab:Label("CD timer uses device os.time() vs saved start — time keeps passing offline; needs settings saved (Auto Save or after cap).")
 local totemFilterColorToggle = SacTab:Toggle("Totem: By color (OneIn)", "Totem only — OneIn ≤ tier below (not tied to Fountain filters) — saved", states.totemFilterColor, function(on)
     states.totemFilterColor = on == true
@@ -1387,6 +1440,7 @@ end)
 SacTab:Label("Highest Rank first among Totem-eligible weapons.")
 totemStatusLbl = SacTab:Label("Totem: —")
 local totemLastLbl = SacTab:Label("Totem last: —")
+SacTab:Label("Totem auto safety: waits 30s once when hourly CD reaches 0 to avoid stale re-lock text.")
 SacTab:Button("📊", "Totem Status", "Refresh progress / cooldown / AP max", C.accent, function()
     updateTotemStatusLbl()
     SLbl.Text = "Totem status updated"
@@ -1402,7 +1456,7 @@ SacTab:Button("🕯️", "Totem: sacrifice 1 (best Rank)", "Totem By color + Tot
             cd = "On cooldown",
             local_cap = "At cycle cap (wait CD or refresh)",
             no_weapon = "No weapon (enable Totem By color or refresh inv)",
-            server_cap = "Server capped — 1h CD started",
+            server_reject = "Server rejected this attempt (not starting CD from text alone)",
             fail = "TotemConfirm error (remote missing or InvokeServer threw)",
         })[why] or tostring(why)
         totemLastLbl.Set("Totem last: " .. msg)
@@ -1571,7 +1625,7 @@ addThread(task.spawn(function()
         if totemLastLbl then
             if ok then
                 totemLastLbl.Set("Totem last: " .. tostring(why))
-            elseif why == "no_weapon" or why == "fail" then
+            elseif why == "no_weapon" or why == "fail" or why == "wait" or why == "server_reject" then
                 totemLastLbl.Set("Totem auto: " .. tostring(why))
             end
         end
