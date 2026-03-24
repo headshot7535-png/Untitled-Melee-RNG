@@ -1224,6 +1224,21 @@ local function totemPassesNameTickGate(w)
     return _sacNameSelected[w.name] == true
 end
 
+local function totemRemoteWeaponName(fullName)
+    local n = tostring(fullName or ""):match("^%s*(.-)%s*$") or ""
+    if n == "" then return n end
+    local low = n:lower()
+    for _, t in ipairs(SAC_TIERS) do
+        local pref = (t.name .. " "):lower()
+        if low:sub(1, #pref) == pref then
+            local stripped = n:sub(#pref + 1):match("^%s*(.-)%s*$") or ""
+            if stripped ~= "" then return stripped end
+            break
+        end
+    end
+    return n
+end
+
 local function totemEligibleCountCached()
     local keep = math.max(0, math.floor(tonumber(states.totemKeepQty) or 0))
     local n = 0
@@ -1438,10 +1453,11 @@ local function totemExecuteNext()
     if not tr then return false, "fail" end
     _totemLastConfirmClock = os.clock()
     -- Cobalt-style: one string = that row's inventory weapon name.
-    print(string.format("[MeleeRNG/Totem] %d/%d in color · TotemConfirm(%q)", idx, nCand, w.name))
-    local invokeOk, res = pcall(function() return tr:InvokeServer(w.name) end)
+    local remoteName = totemRemoteWeaponName(w.name)
+    print(string.format("[MeleeRNG/Totem] %d/%d in color · inv=%q -> send=%q", idx, nCand, w.name, remoteName))
+    local invokeOk, res = pcall(function() return tr:InvokeServer(remoteName) end)
     if not invokeOk then
-        invokeOk, res = pcall(function() return tr:InvokeServer(w.name, w.type) end)
+        invokeOk, res = pcall(function() return tr:InvokeServer(remoteName, w.type) end)
     end
     if not invokeOk then
         advanceTotemRoundRobin()
