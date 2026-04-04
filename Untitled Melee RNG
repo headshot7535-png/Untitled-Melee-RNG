@@ -425,7 +425,7 @@ end
 -- Main chunk was hitting Luau's ~200 local register limit; UI + re-exec live in their own function.
 local SLbl = (function()
 -- ============================================================
---  BUILD WINDOW  (tabs: Move → ESP → Areas → Upgrades → Sacrifice → Chat → Misc)
+--  BUILD WINDOW  (tabs: Move → ESP → Areas → Upgrades → Sacrifice → Misc)
 -- ============================================================
 local Win  = Lib:Window({ title = "⚔️  Melee RNG  v1.0" })
 local SLbl = Win._status
@@ -1760,7 +1760,6 @@ addThread(task.spawn(function()
     end)
 end))
 
-Win:ChatTab()
 local MiscTab = Win:Tab("⚙️", "Misc")
 
 -- ============================================================
