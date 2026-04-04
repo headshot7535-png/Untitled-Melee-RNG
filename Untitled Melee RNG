@@ -3127,15 +3127,15 @@ task.defer(function()
 end)
 
 MiscTab:Section("Community")
-MiscTab:Button("💬", "Join Discord", "Opens discord.gg/vSTmMTyw in browser", C.purple, function()
+MiscTab:Button("💬", "Join Discord", "Opens discord.gg/ErGUHtVK in browser", C.purple, function()
     if setclipboard then
-        setclipboard("https://discord.gg/vSTmMTyw")
+        setclipboard("https://discord.gg/ErGUHtVK")
         SLbl.Text = "Discord link copied to clipboard!"
     end
-    if syn and syn.openUrl then syn.openUrl("https://discord.gg/vSTmMTyw")
-    elseif (function() local ok, _ = pcall(function() return game:GetService("GuiService"):OpenBrowserWindow("https://discord.gg/vSTmMTyw") end) return ok end)() then
+    if syn and syn.openUrl then syn.openUrl("https://discord.gg/ErGUHtVK")
+    elseif (function() local ok, _ = pcall(function() return game:GetService("GuiService"):OpenBrowserWindow("https://discord.gg/ErGUHtVK") end) return ok end)() then
     end
-    SLbl.Text = "discord.gg/vSTmMTyw — link copied!"
+    SLbl.Text = "discord.gg/ErGUHtVK — link copied!"
 end)
 
 MiscTab:Section("Script")
