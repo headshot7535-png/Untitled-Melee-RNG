@@ -3091,7 +3091,7 @@ local perfOtherToggle = MiscTab:Toggle("Hide Other Players' Weapons", "LocalTran
     saveSettings()
     SLbl.Text = on and "Perf: others’ weapons hidden" or "Perf: others’ weapons shown"
 end)
-local perfOwnToggle = MiscTab:Toggle("Hide Own Weapons", "Same for workspace[" .. LP.Name .. "] (your equipped spins) — saved", states.perfHideOwnWeapons, function(on)
+local perfOwnToggle = MiscTab:Toggle("Hide Own Weapons", "Hides models under your workspace player folder (same place as hitbox pulse) — saved", states.perfHideOwnWeapons, function(on)
     states.perfHideOwnWeapons = on == true
     saveSettings()
     SLbl.Text = on and "Perf: your weapons hidden" or "Perf: your weapons shown"
