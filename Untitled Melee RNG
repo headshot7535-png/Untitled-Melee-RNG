@@ -368,6 +368,10 @@ local states = {
     perfHideOtherWeapons = false,
     perfHideOwnWeapons   = false,
     perfHideAllEffects   = false,
+    perfDisableShadows   = false, -- Lighting.GlobalShadows
+    perfHideLootDrops    = false, -- workspace.Loot (dump LootController)
+    perfMuteWorldSounds  = false, -- Sound instances under workspace
+    perfCompatLighting   = false, -- Lighting.Technology → Compatibility
 }
 
 -- Upgrade names for save/load (must exist before saveSettings references upgradeSelected)
@@ -526,6 +530,10 @@ states.autoApUpgrades = states.autoApUpgrades == true
 states.perfHideOtherWeapons = states.perfHideOtherWeapons == true
 states.perfHideOwnWeapons = states.perfHideOwnWeapons == true
 states.perfHideAllEffects = states.perfHideAllEffects == true
+states.perfDisableShadows = states.perfDisableShadows == true
+states.perfHideLootDrops = states.perfHideLootDrops == true
+states.perfMuteWorldSounds = states.perfMuteWorldSounds == true
+states.perfCompatLighting = states.perfCompatLighting == true
 states.guildSpReserve = math.clamp(math.floor(tonumber(states.guildSpReserve) or 0), 0, 100000000)
 -- Totem CD/cap from LS applied in totem block (after TOTEM_CYCLE_SEC) + sanitize vs os.time()
 
@@ -2143,6 +2151,100 @@ local _perfPartLTM = {} -- [BasePart] = prior LocalTransparencyModifier while hi
 local _perfEffOn = {}   -- [ParticleEmitter|Trail|Beam] = prior Enabled while hidden
 local _perfLastEffectsHidden = false
 local _perfFxAcc = 0    -- throttle workspace:GetDescendants() sweeps (~every 5×0.12s)
+local _perfLootLTM = {} -- loot drop parts (separate from weapon LTM map)
+local _perfSoundVol = {} -- [Sound] = prior Volume
+local _perfSoundAcc = 0
+local _perfSavedGlobalShadows = nil -- bool | nil
+local _perfSavedTechnology = nil    -- Enum.Technology | nil
+
+local function perfApplyShadows(disable)
+    if disable then
+        if _perfSavedGlobalShadows == nil then
+            _perfSavedGlobalShadows = Lighting.GlobalShadows
+        end
+        Lighting.GlobalShadows = false
+    else
+        if _perfSavedGlobalShadows ~= nil then
+            Lighting.GlobalShadows = _perfSavedGlobalShadows
+            _perfSavedGlobalShadows = nil
+        end
+    end
+end
+
+local function perfApplyCompatLighting(on)
+    if on then
+        if _perfSavedTechnology == nil then
+            _perfSavedTechnology = Lighting.Technology
+        end
+        pcall(function()
+            Lighting.Technology = Enum.Technology.Compatibility
+        end)
+    else
+        if _perfSavedTechnology ~= nil then
+            local t = _perfSavedTechnology
+            _perfSavedTechnology = nil
+            pcall(function() Lighting.Technology = t end)
+        end
+    end
+end
+
+local function perfCleanupStaleLootKeys()
+    for p in pairs(_perfLootLTM) do
+        if not (p and p.Parent) then _perfLootLTM[p] = nil end
+    end
+end
+
+local function perfSweepLootDrops(hide)
+    local loot = workspace:FindFirstChild("Loot")
+    if not loot then return end
+    local function applyPart(d)
+        if not d:IsA("BasePart") then return end
+        if hide then
+            if _perfLootLTM[d] == nil then
+                _perfLootLTM[d] = d.LocalTransparencyModifier
+            end
+            d.LocalTransparencyModifier = 1
+        else
+            local prev = _perfLootLTM[d]
+            if prev ~= nil then
+                d.LocalTransparencyModifier = prev
+                _perfLootLTM[d] = nil
+            end
+        end
+    end
+    for _, ch in ipairs(loot:GetChildren()) do
+        if ch:IsA("Model") then
+            for _, d in ipairs(ch:GetDescendants()) do applyPart(d) end
+        else
+            applyPart(ch)
+        end
+    end
+end
+
+local function perfRestoreAllLoot()
+    perfSweepLootDrops(false)
+    perfCleanupStaleLootKeys()
+end
+
+local function perfRestoreAllWorldSounds()
+    for snd, vol in pairs(_perfSoundVol) do
+        pcall(function()
+            if snd.Parent then snd.Volume = vol end
+        end)
+    end
+    for k in pairs(_perfSoundVol) do _perfSoundVol[k] = nil end
+end
+
+local function perfSweepWorldSoundsMute()
+    for _, d in ipairs(workspace:GetDescendants()) do
+        if d:IsA("Sound") then
+            if _perfSoundVol[d] == nil then
+                _perfSoundVol[d] = d.Volume
+            end
+            d.Volume = 0
+        end
+    end
+end
 
 local function perfCleanupStalePartKeys()
     for p in pairs(_perfPartLTM) do
@@ -2204,18 +2306,29 @@ local function perfRestoreAllWeaponFolders()
     perfCleanupStalePartKeys()
 end
 
+local _perfLastSoundsMuted = false
+
 addThread(task.spawn(function()
     while true do
         if GEN ~= _G.MeleeRNG_Gen then break end
         local ow = states.perfHideOtherWeapons
         local sw = states.perfHideOwnWeapons
         local ef = states.perfHideAllEffects
-        if not ow and not sw and not ef then
+        local lo = states.perfHideLootDrops
+        local ws = states.perfMuteWorldSounds
+        if not ow and not sw and not ef and not lo and not ws then
             if _perfLastEffectsHidden then
                 perfRestoreEffects()
                 _perfLastEffectsHidden = false
             end
+            _perfFxAcc = 0
             perfRestoreAllWeaponFolders()
+            perfRestoreAllLoot()
+            if _perfLastSoundsMuted then
+                perfRestoreAllWorldSounds()
+                _perfLastSoundsMuted = false
+            end
+            _perfSoundAcc = 0
             task.wait(0.5)
             continue
         end
@@ -2226,15 +2339,15 @@ addThread(task.spawn(function()
             perfSweepWeaponFolder(workspace:FindFirstChild(LP.Name), false)
         end
         if ow then
-            for _, pl in ipairs(Players:GetPlayers()) do
-                if pl ~= LP then
-                    perfSweepWeaponFolder(workspace:FindFirstChild(pl.Name), true)
+            for _, plr in ipairs(Players:GetPlayers()) do
+                if plr ~= LP then
+                    perfSweepWeaponFolder(workspace:FindFirstChild(plr.Name), true)
                 end
             end
         else
-            for _, pl in ipairs(Players:GetPlayers()) do
-                if pl ~= LP then
-                    perfSweepWeaponFolder(workspace:FindFirstChild(pl.Name), false)
+            for _, plr in ipairs(Players:GetPlayers()) do
+                if plr ~= LP then
+                    perfSweepWeaponFolder(workspace:FindFirstChild(plr.Name), false)
                 end
             end
         end
@@ -2250,6 +2363,24 @@ addThread(task.spawn(function()
             _perfFxAcc = 0
             perfRestoreEffects()
             _perfLastEffectsHidden = false
+        end
+        if lo then
+            perfSweepLootDrops(true)
+        else
+            perfSweepLootDrops(false)
+        end
+        perfCleanupStaleLootKeys()
+        if ws then
+            _perfSoundAcc = _perfSoundAcc + 1
+            if _perfSoundAcc >= 6 then
+                _perfSoundAcc = 0
+                perfSweepWorldSoundsMute()
+            end
+            _perfLastSoundsMuted = true
+        elseif _perfLastSoundsMuted then
+            perfRestoreAllWorldSounds()
+            _perfLastSoundsMuted = false
+            _perfSoundAcc = 0
         end
     end
 end))
@@ -3085,7 +3216,7 @@ MiscTab:Toggle("🙈 Show HideMobs Button", "Keeps HideMobsBtn visible — saved
 end)
 
 MiscTab:Section("Performance")
-MiscTab:Label("Hide spinning weapons to reduce lag. Client-only (workspace weapon folders + VFX).")
+MiscTab:Label("Client-only FPS helpers. Does not change server / combat hitboxes.")
 local perfOtherToggle = MiscTab:Toggle("Hide Other Players' Weapons", "LocalTransparencyModifier on models under workspace[their name] — saved", states.perfHideOtherWeapons, function(on)
     states.perfHideOtherWeapons = on == true
     saveSettings()
@@ -3106,11 +3237,56 @@ local perfFxToggle = MiscTab:Toggle("Hide All Effects", "Disables ParticleEmitte
     end
     SLbl.Text = on and "Perf: workspace VFX off" or "Perf: workspace VFX restored"
 end)
+local perfLootToggle = MiscTab:Toggle("Hide Loot Drops", "Hides dropped weapons under workspace.Loot (client visibility only) — saved", states.perfHideLootDrops, function(on)
+    states.perfHideLootDrops = on == true
+    saveSettings()
+    if on == true then pcall(function() perfSweepLootDrops(true) end) end
+    SLbl.Text = on and "Perf: loot hidden" or "Perf: loot visible"
+end)
+local perfSoundToggle = MiscTab:Toggle("Mute World Sounds", "Sets workspace Sound.Volume to 0 (restores when off). Throttled rescans for new sounds — saved", states.perfMuteWorldSounds, function(on)
+    states.perfMuteWorldSounds = on == true
+    saveSettings()
+    if on == true then
+        pcall(perfSweepWorldSoundsMute)
+        _perfLastSoundsMuted = true
+        _perfSoundAcc = 0
+    end
+    SLbl.Text = on and "Perf: world sounds muted" or "Perf: world sounds restored"
+end)
+local perfShadowToggle = MiscTab:Toggle("Disable Global Shadows", "Lighting.GlobalShadows = false while ON (restores prior when off) — saved", states.perfDisableShadows, function(on)
+    states.perfDisableShadows = on == true
+    saveSettings()
+    perfApplyShadows(on == true)
+    SLbl.Text = on and "Perf: shadows OFF" or "Perf: shadows restored"
+end)
+local perfTechToggle = MiscTab:Toggle("Compatibility Lighting", "Lighting.Technology → Compatibility (older/cheaper pipeline; restores when off) — saved", states.perfCompatLighting, function(on)
+    states.perfCompatLighting = on == true
+    saveSettings()
+    perfApplyCompatLighting(on == true)
+    SLbl.Text = on and "Perf: Compatibility lighting" or "Perf: lighting tech restored"
+end)
 task.defer(function()
     pcall(function()
         if perfOtherToggle and perfOtherToggle.Set then perfOtherToggle.Set(states.perfHideOtherWeapons) end
         if perfOwnToggle and perfOwnToggle.Set then perfOwnToggle.Set(states.perfHideOwnWeapons) end
         if perfFxToggle and perfFxToggle.Set then perfFxToggle.Set(states.perfHideAllEffects) end
+        if perfLootToggle and perfLootToggle.Set then perfLootToggle.Set(states.perfHideLootDrops) end
+        if perfSoundToggle and perfSoundToggle.Set then perfSoundToggle.Set(states.perfMuteWorldSounds) end
+        if perfShadowToggle and perfShadowToggle.Set then perfShadowToggle.Set(states.perfDisableShadows) end
+        if perfTechToggle and perfTechToggle.Set then perfTechToggle.Set(states.perfCompatLighting) end
+        if states.perfDisableShadows then perfApplyShadows(true) end
+        if states.perfCompatLighting then perfApplyCompatLighting(true) end
+        if states.perfMuteWorldSounds then
+            pcall(perfSweepWorldSoundsMute)
+            _perfLastSoundsMuted = true
+            _perfSoundAcc = 0
+        end
+        if states.perfHideLootDrops then pcall(function() perfSweepLootDrops(true) end) end
+        if states.perfHideAllEffects then
+            pcall(perfSweepEffectsHide)
+            _perfLastEffectsHidden = true
+            _perfFxAcc = 0
+        end
     end)
 end)
 
