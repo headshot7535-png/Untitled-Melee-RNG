@@ -341,7 +341,7 @@ local states = {
     hitboxPulse    = false,
     hitboxDutyCycle  = 2,  -- BIG on 1 frame per N heartbeats (2 = half the frames big, old behavior; 6+ = mostly tiny, less physics lag)
     autoUpgradeOn  = false,  -- master Auto Upgrade loop (saved with other toggles)
-    autoManaToSP   = false,  -- Heartbeat: CalculateManaPrice + ConvertMana (1 unit, ~10/s cap)
+    autoManaToSP   = false,  -- Heartbeat: price check + ConvertMana(1); backoff if server returns false
     -- Guild: BuyGP(SP) → GP; BuyGuildBuff(guildId, name) — dump GuildUIController
     autoGuildSpToGp = false,  -- members: spend SP down to guildSpReserve
     guildSpReserve  = 0,      -- min SP to keep when auto SP→GP
@@ -352,6 +352,11 @@ local states = {
     ascendAfterTpX = DEF_ASCEND_TP_X,
     ascendAfterTpY = DEF_ASCEND_TP_Y,
     ascendAfterTpZ = DEF_ASCEND_TP_Z,
+    -- After ascend, AuraRollUI (KEEP AURA = Options.ConfirmBtn) — wait, confirm, then TP (AuraRollController dump)
+    ascendAuraKeepBeforeTp = true,
+    -- Equipped = Character.SelectedAura; remotes GetUnlockedAuras / SelectAura (AuraSelectionController dump)
+    auraPreferredName = "",
+    auraMaintainSelection = false,
     -- Sacrifice (Fountain) — OneIn tiers from RS.Assets.Weapons; only By color + By name
     autoSacrifice    = false,
     sacFilterColor   = false,  -- OneIn ≤ selected tier max (game color / rarity)
@@ -525,6 +530,17 @@ states.sacKeepQty      = math.clamp(math.floor(tonumber(states.sacKeepQty) or 0)
 states.ascendAfterTpX  = tonumber(states.ascendAfterTpX) or DEF_ASCEND_TP_X
 states.ascendAfterTpY  = tonumber(states.ascendAfterTpY) or DEF_ASCEND_TP_Y
 states.ascendAfterTpZ  = tonumber(states.ascendAfterTpZ) or DEF_ASCEND_TP_Z
+if LS.ascendAuraKeepBeforeTp ~= nil then
+    states.ascendAuraKeepBeforeTp = LS.ascendAuraKeepBeforeTp == true
+else
+    states.ascendAuraKeepBeforeTp = states.ascendAuraKeepBeforeTp ~= false
+end
+if type(states.auraPreferredName) == "string" then
+    states.auraPreferredName = states.auraPreferredName:gsub("^%s+", ""):gsub("%s+$", "")
+else
+    states.auraPreferredName = ""
+end
+states.auraMaintainSelection = states.auraMaintainSelection == true
 
 states.autoTotem = states.autoTotem == true
 states.totemOnlyTickedNames = states.totemOnlyTickedNames == true
@@ -574,6 +590,103 @@ local function hrpNearAscendTp()
     return (root.Position - tgt).Magnitude <= ASCEND_TP_NEAR_STUDS
 end
 
+-- Post-ascend aura roll (AuraRollUI.Options.ConfirmBtn = KEEP AURA) — dump AuraRollController
+local _firesignal = rawget(_G, "firesignal")
+local _getconnections = rawget(_G, "getconnections")
+local AURA_KEEP_POLL_SEC      = 0.2
+local AURA_KEEP_MAX_WAIT_SEC  = 90
+local AURA_NO_ROLL_SKIP_SEC   = 8
+
+local function fireGuiButtonClick(btn)
+    if not btn then return false end
+    local sig = btn.MouseButton1Click
+    if type(_firesignal) == "function" and pcall(_firesignal, sig) then
+        return true
+    end
+    if type(_getconnections) == "function" then
+        local ok, conns = pcall(_getconnections, sig)
+        if ok and type(conns) == "table" then
+            local ran = false
+            for _, c in ipairs(conns) do
+                if type(c) == "table" and type(c.Function) == "function" then
+                    pcall(c.Function)
+                    ran = true
+                end
+            end
+            if ran then return true end
+        end
+    end
+    return false
+end
+
+local function manualAuraRollUiClose(main, roll)
+    local general = main and main:FindFirstChild("GeneralUI")
+    pcall(function()
+        roll.Visible = false
+        if general then general.Visible = true end
+        local ch = LP.Character
+        local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+        if hrp then hrp.Anchored = false end
+        local ar = workspace:FindFirstChild("AuraRollArea")
+        if ar and ar.Parent == workspace then
+            ar.Parent = RS
+        end
+        workspace.CurrentCamera.CameraType = Enum.CameraType.Custom
+    end)
+    return true
+end
+
+--- One-shot: when Options + ConfirmBtn are visible, fire KEEP (or mirror client cleanup). Returns true if keep was triggered.
+local function tryFireAuraKeepOnce(main)
+    if not main then return false end
+    local roll = main:FindFirstChild("AuraRollUI")
+    if not roll then return false end
+    local opts = roll:FindFirstChild("Options")
+    if not roll.Visible then
+        if opts then pcall(function() opts:SetAttribute("_MeleeKeptAura", nil) end) end
+        return false
+    end
+    if not opts or not opts.Visible then return false end
+    if opts:GetAttribute("_MeleeKeptAura") then return false end
+    local confirm = opts:FindFirstChild("ConfirmBtn")
+    if not confirm then return false end
+    local ok = fireGuiButtonClick(confirm)
+    if not ok then
+        ok = manualAuraRollUiClose(main, roll)
+    end
+    if ok then
+        pcall(function() opts:SetAttribute("_MeleeKeptAura", true) end)
+    end
+    return ok
+end
+
+local function waitAscendAuraKeepIfNeeded()
+    if not states.ascendAuraKeepBeforeTp then return end
+    local t0 = os.clock()
+    local seenRoll = false
+    local noRollSince = nil
+    while os.clock() - t0 < AURA_KEEP_MAX_WAIT_SEC do
+        if GEN ~= _G.MeleeRNG_Gen then return end
+        local pg = LP:FindFirstChild("PlayerGui")
+        local main = pg and pg:FindFirstChild("MainGUI")
+        local roll = main and main:FindFirstChild("AuraRollUI")
+        if roll and roll.Visible then
+            seenRoll = true
+            noRollSince = nil
+        else
+            if not noRollSince then noRollSince = os.clock() end
+            if not seenRoll and (os.clock() - noRollSince) >= AURA_NO_ROLL_SKIP_SEC then
+                return
+            end
+        end
+        if main and tryFireAuraKeepOnce(main) then
+            task.wait(0.35)
+            return
+        end
+        task.wait(AURA_KEEP_POLL_SEC)
+    end
+end
+
 --- Wait for Ascends to increase, then keep TPing until local HRP reaches saved position once (or chase timeout).
 local function teleportAfterAscendIfConfirmed(beforeAscends)
     beforeAscends = tonumber(beforeAscends) or 0
@@ -588,6 +701,12 @@ local function teleportAfterAscendIfConfirmed(beforeAscends)
         end
     end
     if not ascended then return false end
+
+    waitAscendAuraKeepIfNeeded()
+    task.spawn(function()
+        task.wait(0.75)
+        maintainPreferredAuraSelection(true)
+    end)
 
     local deadline = os.clock() + ASCEND_TP_MAX_CHASE
     while os.clock() < deadline do
@@ -611,6 +730,234 @@ local function formatAscendTpSaved()
         tonumber(states.ascendAfterTpX) or DEF_ASCEND_TP_X,
         tonumber(states.ascendAfterTpY) or DEF_ASCEND_TP_Y,
         tonumber(states.ascendAfterTpZ) or DEF_ASCEND_TP_Z)
+end
+
+-- ── Aura (SelectedAura attribute + GetUnlockedAuras / SelectAura) ───────────
+local function getEquippedAuraName()
+    local ch = LP.Character
+    if not ch then return nil end
+    local a = ch:GetAttribute("SelectedAura")
+    return (type(a) == "string" and a ~= "") and a or nil
+end
+
+local function getRolledAuraNameFromRollUi()
+    local pg = LP:FindFirstChild("PlayerGui")
+    local main = pg and pg:FindFirstChild("MainGUI")
+    local roll = main and main:FindFirstChild("AuraRollUI")
+    if not roll or not roll.Visible then return nil end
+    local lastText = nil
+    for _, ch in ipairs(roll:GetChildren()) do
+        local an = ch:FindFirstChild("AuraName")
+        if an and an:IsA("TextLabel") and an.Text ~= "" then
+            lastText = an.Text
+        end
+    end
+    return lastText
+end
+
+local function fetchUnlockedAuraNamesSorted()
+    local raw = invokeR("GetUnlockedAuras")
+    if type(raw) ~= "table" then return {} end
+    local keys = {}
+    for k in pairs(raw) do
+        if type(k) == "string" and k ~= "" then
+            keys[#keys + 1] = k
+        end
+    end
+    table.sort(keys)
+    return keys
+end
+
+local function buildAuraDropdownOptions(names)
+    local o = { { text = "(none)", value = "" } }
+    for _, n in ipairs(names) do
+        o[#o + 1] = { text = n, value = n }
+    end
+    return o
+end
+
+local _auraMaintainLastFire = 0
+local AURA_MAINTAIN_COOLDOWN = 2.5
+
+-- Only FireServer SelectAura when Character.SelectedAura ≠ preferred (no redundant re-equip).
+local function maintainPreferredAuraSelection(forceNow)
+    if not states.auraMaintainSelection then return end
+    local want = states.auraPreferredName
+    if type(want) ~= "string" or want == "" then return end
+    if not R("SelectAura") then return end
+    if getEquippedAuraName() == want then return end
+    local now = os.clock()
+    if not forceNow and (now - _auraMaintainLastFire) < AURA_MAINTAIN_COOLDOWN then return end
+    local raw = invokeR("GetUnlockedAuras")
+    if type(raw) ~= "table" or raw[want] == nil then return end
+    _auraMaintainLastFire = now
+    fireR("SelectAura", want)
+end
+
+--- "fired" = remote sent; "already" = SelectedAura already matches; "fail" = bad name / locked / no remote
+local function forceSelectPreferredAuraNow()
+    local name = states.auraPreferredName
+    if type(name) ~= "string" or name == "" then return "fail" end
+    if not R("SelectAura") then return "fail" end
+    if getEquippedAuraName() == name then return "already" end
+    local raw = invokeR("GetUnlockedAuras")
+    if type(raw) ~= "table" or raw[name] == nil then return "fail" end
+    _auraMaintainLastFire = os.clock()
+    fireR("SelectAura", name)
+    return "fired"
+end
+
+-- Guild / AP tab UI in separate functions (Luau: `do` does not reduce locals; only nested functions do).
+local function meleeGuiMountGuildTab(GuildTab, SLbl, C)
+    GuildTab:Section("Status")
+    local guildStatusLbl = GuildTab:Label("Guild: — (join/create in game)")
+    GuildTab:Label("Remotes: BuyGP(spAmount) · BuyGuildBuff(guildId, buff). Buffs match GuildConstants.")
+
+    GuildTab:Section("SP → GP")
+    local guildSpToGpToggle = GuildTab:Toggle("💠 Auto SP → GP", "In a guild as member: calls BuyGP with (SP − reserve) ~2/s. Same as Add GP page SP box — saved.", states.autoGuildSpToGp, function(on)
+        states.autoGuildSpToGp = on == true
+        saveSettings()
+        SLbl.Text = on and "Guild: Auto SP→GP ON" or "Guild: Auto SP→GP OFF"
+    end)
+    GuildTab:Slider("Reserve SP", "Never spend below this much SP when Auto SP→GP runs (saved)", {
+        min = 0, max = 100000000, default = math.clamp(states.guildSpReserve, 0, 100000000),
+        format = function(v) return string.format("keep %s SP", tostring(math.floor(v))) end,
+    }, function(v)
+        states.guildSpReserve = math.clamp(math.floor(v), 0, 100000000)
+        saveSettings()
+    end)
+    GuildTab:Button("➕", "SP → GP once", "BuyGP(current SP minus reserve) one shot", C.accent, function()
+        if not R("BuyGP") then SLbl.Text = "⚠ BuyGP remote missing"; return end
+        local g = fetchGuildState()
+        if not g or not guildPlayerIsMember(g) then SLbl.Text = "⚠ Not in a guild"; return end
+        local sp = tonumber(getSP()) or 0
+        local reserve = math.max(0, math.floor(tonumber(states.guildSpReserve) or 0))
+        local spend = math.floor(sp - reserve)
+        if spend <= 0 then SLbl.Text = "⚠ No SP to spend (check reserve)"; return end
+        invokeR("BuyGP", spend)
+        _cachedStats["SP"] = nil
+        SLbl.Text = "✓ BuyGP(" .. tostring(spend) .. " SP)"
+    end)
+
+    GuildTab:Section("Buff upgrades")
+    local guildBuffAutoToggle = GuildTab:Toggle("⚔️ Auto guild buff upgrades", "Guild owner only. Each tick buys the cheapest affordable buff among the toggles below — saved.", states.autoGuildBuffs, function(on)
+        states.autoGuildBuffs = on == true
+        saveSettings()
+        SLbl.Text = on and "Guild: Auto buffs ON" or "Guild: Auto buffs OFF"
+    end)
+    GuildTab:Label("Buff targets (ON = included; auto picks cheapest):")
+    local guildBuffToggles = {}
+    for _, gn in ipairs(GUILD_BUFF_ORDER) do
+        guildBuffToggles[gn] = GuildTab:Toggle(gn, "Allow auto guild upgrade to buy this buff — saved", guildBuffSelected[gn] == true, function(on)
+            guildBuffSelected[gn] = (on == true)
+            saveSettings()
+        end)
+    end
+    GuildTab:Button("✅", "Buffs: all / none", "Flip every guild buff target on or off at once — saved", C.green, function()
+        local anyOff = false
+        for _, n in ipairs(GUILD_BUFF_ORDER) do
+            if not guildBuffSelected[n] then anyOff = true; break end
+        end
+        local turnOn = anyOff
+        for _, n in ipairs(GUILD_BUFF_ORDER) do
+            guildBuffSelected[n] = turnOn
+            local tr = guildBuffToggles[n]
+            if tr and tr.Set then pcall(function() tr.Set(turnOn) end) end
+        end
+        saveSettings()
+        SLbl.Text = turnOn and "Guild buffs: all ON" or "Guild buffs: all OFF"
+    end)
+
+    task.defer(function()
+        pcall(function()
+            if guildSpToGpToggle and guildSpToGpToggle.Set then guildSpToGpToggle.Set(states.autoGuildSpToGp) end
+            if guildBuffAutoToggle and guildBuffAutoToggle.Set then guildBuffAutoToggle.Set(states.autoGuildBuffs) end
+            for _, gn in ipairs(GUILD_BUFF_ORDER) do
+                local tr = guildBuffToggles[gn]
+                if tr and tr.Set then tr.Set(guildBuffSelected[gn] == true) end
+            end
+        end)
+    end)
+
+    return {
+        guildStatusLbl = guildStatusLbl,
+        guildSpToGpToggle = guildSpToGpToggle,
+        guildBuffAutoToggle = guildBuffAutoToggle,
+        guildBuffToggles = guildBuffToggles,
+    }
+end
+
+local function meleeGuiMountApTab(ApTab, SLbl, C)
+    ApTab:Section("Ascend Points upgrades")
+    local apStatusLbl = ApTab:Label("Ascend Points: —")
+    ApTab:Label("SharedConstants.AscendUpgrades · Remotes: GetAscendPoints, GetAscendUpgrades, UpgradeAscend(name). Max L10.")
+    local apAutoToggle = ApTab:Toggle("⚡ Auto AP upgrades", "Buys the cheapest affordable upgrade among toggled rows (~1.2s). Saved.", states.autoApUpgrades, function(on)
+        states.autoApUpgrades = on == true
+        saveSettings()
+        SLbl.Text = on and "Ascend AP: auto ON" or "Ascend AP: auto OFF"
+    end)
+    ApTab:Label("Include in auto (cheapest among ON):")
+    local apUpgradeToggles = {}
+    for _, an in ipairs(ASCEND_AP_ORDER) do
+        apUpgradeToggles[an] = ApTab:Toggle(an, "Allow auto to purchase this AP statue upgrade — saved", apUpgradeSelected[an] == true, function(on)
+            apUpgradeSelected[an] = (on == true)
+            saveSettings()
+        end)
+    end
+    ApTab:Button("✅", "AP upgrades: all / none", "Flip every AP upgrade toggle — saved", C.green, function()
+        local anyOff = false
+        for _, n in ipairs(ASCEND_AP_ORDER) do
+            if not apUpgradeSelected[n] then anyOff = true; break end
+        end
+        local turnOn = anyOff
+        for _, n in ipairs(ASCEND_AP_ORDER) do
+            apUpgradeSelected[n] = turnOn
+            local tr = apUpgradeToggles[n]
+            if tr and tr.Set then pcall(function() tr.Set(turnOn) end) end
+        end
+        saveSettings()
+        SLbl.Text = turnOn and "AP upgrades: all ON" or "AP upgrades: all OFF"
+    end)
+    ApTab:Button("⬆️", "Upgrade once (cheapest)", "Single UpgradeAscend for cheapest affordable row that is toggled ON", C.accent, function()
+        if not R("UpgradeAscend") then SLbl.Text = "⚠ UpgradeAscend missing"; return end
+        local levels = invokeR("GetAscendUpgrades")
+        if type(levels) ~= "table" then SLbl.Text = "⚠ GetAscendUpgrades failed"; return end
+        local ap = parseAscendPoints(invokeR("GetAscendPoints"))
+        local rows = {}
+        for _, name in ipairs(ASCEND_AP_ORDER) do
+            if apUpgradeSelected[name] ~= true then continue end
+            local lvl = tonumber(levels[name]) or 0
+            if lvl >= ASCEND_AP_MAX_LEVEL then continue end
+            local cost = ascendApNextCost(name, lvl)
+            if type(cost) == "number" and cost == cost and cost > 0 and cost < math.huge then
+                rows[#rows + 1] = { name = name, cost = cost }
+            end
+        end
+        table.sort(rows, function(a, b) return a.cost < b.cost end)
+        for _, row in ipairs(rows) do
+            if ap < row.cost then SLbl.Text = string.format("⚠ Need %d AP for %s", row.cost, row.name); return end
+            local ok, newLevel = invokeR2("UpgradeAscend", row.name)
+            if ok and type(newLevel) == "number" then
+                SLbl.Text = "✓ " .. row.name .. " → L" .. tostring(newLevel)
+                return
+            end
+        end
+        SLbl.Text = "⚠ No upgrade bought (maxed or server rejected)"
+    end)
+    task.defer(function()
+        pcall(function()
+            if apAutoToggle and apAutoToggle.Set then apAutoToggle.Set(states.autoApUpgrades) end
+            for _, an in ipairs(ASCEND_AP_ORDER) do
+                local tr = apUpgradeToggles[an]
+                if tr and tr.Set then tr.Set(apUpgradeSelected[an] == true) end
+            end
+        end)
+    end)
+    return {
+        apStatusLbl = apStatusLbl,
+        apAutoToggle = apAutoToggle,
+        apUpgradeToggles = apUpgradeToggles,
+    }
 end
 
 -- Main chunk was hitting Luau's ~200 local register limit; UI + re-exec live in their own function.
@@ -688,8 +1035,11 @@ local UpgTab  = Win:Tab("⬆️",  "Upgrades")
 local SacTab  = Win:Tab("🕯️", "Sacrifice")
 local GuildTab = Win:Tab("🏰", "Guild")
 local ApTab    = Win:Tab("🔱", "Ascend AP")
-local guildStatusLbl -- assigned with Guild UI; refreshed in Misc → Stats loop
-local apStatusLbl    -- assigned with Ascend AP UI; refreshed in Stats loop
+local guildStatusLbl -- assigned via meleeGuiMountGuildTab; refreshed in Misc → Stats loop
+local apStatusLbl
+local guildSpToGpToggle, guildBuffAutoToggle, guildBuffToggles
+local apAutoToggle, apUpgradeToggles
+local manaToSpToggle
 
 -- Auto upgrade: SP, GetUnlockedUpgrades / GetUpgradeLevel / BuyUpgrade (prices = SharedConstants client copy)
 
@@ -934,7 +1284,7 @@ UpgTab:Button("✅", "Select All / None", "Toggle all upgrades on or off", C.gre
     saveSettings()
 end)
 
-UpgTab:Section("Live status (updates every 5s)")
+UpgTab:Section("Live status (updates every ~2.5s)")
 local upgLevelLbls = {}
 for _, un in ipairs(UPGRADE_ORDER) do
     upgLevelLbls[un] = UpgTab:Label(un .. ": …")
@@ -968,7 +1318,7 @@ addThread(task.spawn(function()
                 pcall(function() lbl.Set(upgFormatLiveRowText(un)) end)
             end
         end
-        task.wait(5)
+        task.wait(2.5)
     end
 end))
 
@@ -982,7 +1332,7 @@ addThread(task.spawn(function()
         if not states.autoUpgradeOn then
             upgInfoLbl.Set(string.format("SP: %s | %d on | auto OFF | On: %s",
                 upgFormatSp(sp), upgCountSelectedToggles(), upgFormatAllToggled(candidates)))
-            task.wait(2)
+            task.wait(1)
             continue
         end
         local nextName, nextPrice = "none", math.huge
@@ -994,42 +1344,55 @@ addThread(task.spawn(function()
             upgFormatSp(sp), upgCountSelectedToggles(), nextName,
             nextPrice == math.huge and "?" or tostring(math.floor(nextPrice)),
             upgFormatAllToggled(candidates)))
-        task.wait(3)
+        task.wait(1.2)
     end
 end))
 
 -- ── Auto Upgrade Loop ─────────────────────────────────────────────────────
--- Checks every second if we can afford any selected upgrade, buys it, refreshes.
+-- Burst-buy: many BuyUpgrade per cycle while SP ≥ cheapest next price (cap avoids tight loops).
+local UPGRADE_BURST_MAX = 32
+local UPGRADE_LOOP_AFTER_BUY = 0.06
+local UPGRADE_LOOP_IDLE = 0.22
 addThread(task.spawn(function()
     while true do
         if GEN ~= _G.MeleeRNG_Gen then break end
-        task.wait(1)
-        if not states.autoUpgradeOn then continue end
-
-        local sp = getSP()
-        local bought = false
-
-        local candidates = upgBuildSortedCandidates()
-        local spNum = tonumber(sp) or 0
-        for _, row in ipairs(candidates) do
-            local name, price, lvl = row.name, row.price, row.lvl
-            if spNum >= price then
-                local ok = invokeR("BuyUpgrade", name)
-                if ok then
-                    bought = true
-                    upgInvalidatePriceCache()
-                    sp = getCachedStat("SP")
-                    spNum = tonumber(sp) or 0
-                    upgStatusLbl.Set(string.format("✓ Bought: %s Lv%d→Lv%d | SP: %s", name, lvl, lvl + 1, upgFormatSp(sp)))
-                    SLbl.Text = "⬆️ Upgraded: " .. name
-                    _cachedStats["SP"] = nil
-                    break
-                end
-                -- Server rejected; try next cheapest this tick (if any)
-            end
+        if not states.autoUpgradeOn then
+            task.wait(0.45)
+            continue
         end
 
-        if not bought then
+        local sp = getSP()
+        local boughtAny = false
+        local lastCand = nil
+
+        for _ = 1, UPGRADE_BURST_MAX do
+            local candidates = upgBuildSortedCandidates()
+            lastCand = candidates
+            local spNum = tonumber(sp) or 0
+            local boughtThisRound = false
+            for _, row in ipairs(candidates) do
+                local name, price, lvl = row.name, row.price, row.lvl
+                if spNum >= price then
+                    local ok = invokeR("BuyUpgrade", name)
+                    if ok then
+                        boughtThisRound = true
+                        boughtAny = true
+                        upgInvalidatePriceCache()
+                        _cachedStats["SP"] = nil
+                        sp = getSP()
+                        spNum = tonumber(sp) or 0
+                        upgStatusLbl.Set(string.format("✓ Bought: %s Lv%d→Lv%d | SP: %s", name, lvl, lvl + 1, upgFormatSp(sp)))
+                        SLbl.Text = "⬆️ Upgraded: " .. name
+                        task.wait(UPGRADE_LOOP_AFTER_BUY)
+                        break
+                    end
+                end
+            end
+            if not boughtThisRound then break end
+        end
+
+        if not boughtAny then
+            local candidates = lastCand or upgBuildSortedCandidates()
             local nextName, nextPrice = "none", math.huge
             if #candidates > 0 then
                 nextName = candidates[1].name
@@ -1038,8 +1401,10 @@ addThread(task.spawn(function()
             upgStatusLbl.Set(string.format("⏳ Next:%s (%d SP) | Have %s | On:%s",
                 nextName, nextPrice == math.huge and 0 or math.floor(nextPrice), upgFormatSp(sp),
                 upgFormatAllToggled(candidates)))
+            task.wait(UPGRADE_LOOP_IDLE)
+        else
+            task.wait(UPGRADE_LOOP_AFTER_BUY)
         end
-
     end
 end))
 
@@ -2783,22 +3148,45 @@ addConn(UserInputService.JumpRequest:Connect(function()
     end
 end))
 
--- ── Auto Mana → SP (CalculateManaPrice / ConvertMana — 1 unit, throttled ~10/s) ──
+-- ── Auto Mana → SP (CalculateManaPrice / ConvertMana — 1 unit, throttled) ──
+-- invokeR() maps server `false` to nil, so we call InvokeServer here: on false = cap / can't afford → backoff (stops notification spam).
 local _manaConvLast = 0
+local _manaConvBackoffUntil = 0
 addConn(RunService.Heartbeat:Connect(function()
     if GEN ~= _G.MeleeRNG_Gen then return end
     if not states.autoManaToSP then return end
     local now = os.clock()
-    if now - _manaConvLast < 0.1 then return end
+    if now < _manaConvBackoffUntil then return end
+    if now - _manaConvLast < 0.12 then return end
     _manaConvLast = now
     pcall(function()
-        local cost = invokeR("CalculateManaPrice", 1)
-        if cost == nil or cost == false then return end
+        local rConv = R("ConvertMana")
+        local rPrice = R("CalculateManaPrice")
+        if not rConv or not rPrice then return end
+
+        _cachedStats["Mana"] = nil
+        local okPrice, cost = pcall(function() return rPrice:InvokeServer(1) end)
+        if not okPrice or cost == nil then return end
         local c = (typeof(cost) == "number" and cost) or tonumber(cost)
-        if c == nil or c ~= c or c < 0 then return end  -- need finite, non‑negative price
+        if c == nil or c ~= c or c < 0 then return end
+        c = math.ceil(c)
+
         local m = tonumber(getMana()) or 0
-        if m < c then return end  -- not enough mana for this 1× SP step; skip remote
-        invokeR("ConvertMana", 1)
+        if m < c then return end
+
+        local okConv, serverRes = pcall(function() return rConv:InvokeServer(1) end)
+        if not okConv then
+            _manaConvBackoffUntil = now + 2.5
+            return
+        end
+        if serverRes == false then
+            _manaConvBackoffUntil = now + 5
+            _cachedStats["Mana"] = nil
+            _cachedStats["SP"] = nil
+            return
+        end
+        _cachedStats["Mana"] = nil
+        _cachedStats["SP"] = nil
     end)
 end))
 
@@ -3047,6 +3435,11 @@ addConn(LP.CharacterAdded:Connect(function(c)
     if flyBG then flyBG:Destroy(); flyBG = nil end
     enforceSpeed()
     _hitboxCacheDirty = true
+    task.defer(function()
+        task.wait(1)
+        if GEN ~= _G.MeleeRNG_Gen then return end
+        maintainPreferredAuraSelection(true)
+    end)
 end))
 
 -- ============================================================
@@ -3079,6 +3472,15 @@ addThread(task.spawn(function()
         if GEN ~= _G.MeleeRNG_Gen then break end
         task.wait(30)
         pcall(getDmgMulti)
+    end
+end))
+
+-- ── Re-apply preferred aura if game clears SelectedAura ───────
+addThread(task.spawn(function()
+    while true do
+        if GEN ~= _G.MeleeRNG_Gen then break end
+        task.wait(4)
+        pcall(maintainPreferredAuraSelection, false)
     end
 end))
 
@@ -3151,6 +3553,7 @@ MiscTab:Section("Stats & Kill Rate")
 local StatsLbl = MiscTab:Label("Kills: — | Mana: — | SP: — | Ascends: —")
 local KPMLbl   = MiscTab:Label("KPM: — | ETA ascend: —")
 local ETALbl   = MiscTab:Label("Ascend: — / — kills —")
+local AuraStatLbl = MiscTab:Label("Aura: equipped — | roll UI —")
 
 addThread(task.spawn(function()
     while true do
@@ -3189,6 +3592,13 @@ addThread(task.spawn(function()
                 KPMLbl.Set(string.format("KPM: %.1f | Ascend: —", kpm))
                 ETALbl.Set("Ascend: —")
             end
+            local eqA = getEquippedAuraName()
+            local rollA = getRolledAuraNameFromRollUi()
+            AuraStatLbl.Set(string.format(
+                "Aura: equipped %s | roll UI %s | preferred %s",
+                eqA or "—",
+                rollA or "—",
+                (states.auraPreferredName ~= "" and states.auraPreferredName) or "—"))
         end)
     end
 end))
@@ -3214,6 +3624,19 @@ local function refreshAscendTpLbl()
     ascendTpLbl.Set("Saved TP (+3 studs Y): " .. formatAscendTpSaved())
 end
 refreshAscendTpLbl()
+
+local ascendAuraKeepToggle = MiscTab:Toggle("✨ Keep aura before Ascend TP", "Waits for AuraRollUI, fires KEEP (ConfirmBtn), then chases saved TP. Off = TP immediately after ascend. Needs firesignal/getconnections or falls back to UI cleanup.", states.ascendAuraKeepBeforeTp, function(on)
+    states.ascendAuraKeepBeforeTp = on == true
+    saveSettings()
+    SLbl.Text = on and "Ascend: keep aura before TP ON" or "Ascend: keep aura before TP OFF"
+end)
+task.defer(function()
+    pcall(function()
+        if ascendAuraKeepToggle and ascendAuraKeepToggle.Set then
+            ascendAuraKeepToggle.Set(states.ascendAuraKeepBeforeTp)
+        end
+    end)
+end)
 
 MiscTab:Button("📍", "Set Ascend TP Here", "Saves HumanoidRootPart position as after-ascend teleport target", C.green, function()
     local root = getRoot()
@@ -3265,313 +3688,227 @@ MiscTab:Button("🎯", "Check Ascend Status", "Shows (2+Ascends)×1M kill gate v
         tostring(have), tostring(req), tostring(more), tostring(getAscends()), tostring(dest or "?"))
 end)
 
-MiscTab:Section("Machines (workspace.Machines)")
-MiscTab:Label("Open via ProximityPrompt only — no teleport (needs executor fireproximityprompt).")
-
-local MACHINE_NAMES = {"Fountain Of Skill", "Fusion Machine", "Totem Of Fortune", "Weapon Crafter"}
-for _, mname in ipairs(MACHINE_NAMES) do
-    local mn = mname
-    MiscTab:Button("🔧", mn, "Fire " .. mn .. " ProximityPrompt from range (no TP)", C.accent, function()
-        local machines = workspace:FindFirstChild("Machines")
-        local machine  = machines and machines:FindFirstChild(mn)
-        if not machine then SLbl.Text = "⚠ " .. mn .. " not found in workspace.Machines"; return end
-        local prompt = machine:FindFirstChild("ProximityPrompt")
-        if prompt then
-            local ok = pcall(function() fireproximityprompt(prompt) end)
-            SLbl.Text = ok and ("✓ Opened: " .. mn) or ("⚠ fireproximityprompt failed — " .. mn)
-        else
-            SLbl.Text = "⚠ No ProximityPrompt on " .. mn
-        end
-    end)
-end
-
-MiscTab:Section("Game UI")
-MiscTab:Toggle("👁️ Show AutoRaid Button", "Keeps AutoRaidBtn visible — saved & applied on load", states.showAutoRaid, function(on)
-    states.showAutoRaid = on; saveSettings()
-    pcall(function()
-        LP.PlayerGui:WaitForChild("MainGUI",3)
-            :WaitForChild("OptionsList",3)
-            :WaitForChild("AutoRaidBtn",3).Visible = on
-    end)
-    SLbl.Text = on and "✓ AutoRaidBtn shown" or "AutoRaidBtn hidden"
-end)
-MiscTab:Toggle("🙈 Show HideMobs Button", "Keeps HideMobsBtn visible — saved & applied on load", states.showHideMobs, function(on)
-    states.showHideMobs = on; saveSettings()
-    pcall(function()
-        LP.PlayerGui:WaitForChild("MainGUI",3)
-            :WaitForChild("OptionsList",3)
-            :WaitForChild("HideMobsBtn",3).Visible = on
-    end)
-    SLbl.Text = on and "✓ HideMobsBtn shown" or "HideMobsBtn hidden"
-end)
-
-MiscTab:Section("Performance")
-MiscTab:Label("Client-only FPS helpers. Does not change server / combat hitboxes.")
--- One table keeps Luau main-chunk local register count under the 200 limit (executor compile error).
-local perfUi = {}
-perfUi.other = MiscTab:Toggle("Hide Other Players' Weapons", "LocalTransparencyModifier on models under workspace[their name] — saved", states.perfHideOtherWeapons, function(on)
-    states.perfHideOtherWeapons = on == true
-    saveSettings()
-    SLbl.Text = on and "Perf: others’ weapons hidden" or "Perf: others’ weapons shown"
-end)
-perfUi.own = MiscTab:Toggle("Hide Own Weapons", "Hides models under your workspace player folder (same place as hitbox pulse) — saved", states.perfHideOwnWeapons, function(on)
-    states.perfHideOwnWeapons = on == true
-    saveSettings()
-    SLbl.Text = on and "Perf: your weapons hidden" or "Perf: your weapons shown"
-end)
-perfUi.fx = MiscTab:Toggle("Hide All Effects", "Disables ParticleEmitter, Trail, Beam under workspace (restores prior Enabled when off) — saved", states.perfHideAllEffects, function(on)
-    states.perfHideAllEffects = on == true
-    saveSettings()
-    if on == true then
-        pcall(perfSweepEffectsHide)
-        _perfLastEffectsHidden = true
-        _perfFxAcc = 0
+MiscTab:Section("Aura (SelectedAura + remotes)")
+MiscTab:Label("Equipped aura = Character:GetAttribute(\"SelectedAura\"). Unlock list = GetUnlockedAuras; equip = SelectAura(name).")
+local auraPreferredDropdown = MiscTab:Dropdown(
+    "Preferred aura",
+    "Choose one unlocked aura to equip. Tap Refresh if you just unlocked a new one — saved to settings.",
+    buildAuraDropdownOptions({}),
+    1,
+    function(_, val)
+        states.auraPreferredName = (type(val) == "string" and val) or ""
+        saveSettings()
     end
-    SLbl.Text = on and "Perf: workspace VFX off" or "Perf: workspace VFX restored"
-end)
-perfUi.loot = MiscTab:Toggle("Hide Loot Drops", "Hides dropped weapons under workspace.Loot (client visibility only) — saved", states.perfHideLootDrops, function(on)
-    states.perfHideLootDrops = on == true
-    saveSettings()
-    if on == true then pcall(function() perfSweepLootDrops(true) end) end
-    SLbl.Text = on and "Perf: loot hidden" or "Perf: loot visible"
-end)
-perfUi.sound = MiscTab:Toggle("Mute World Sounds", "Sets workspace Sound.Volume to 0 (restores when off). Throttled rescans for new sounds — saved", states.perfMuteWorldSounds, function(on)
-    states.perfMuteWorldSounds = on == true
-    saveSettings()
-    if on == true then
-        pcall(perfSweepWorldSoundsMute)
-        _perfLastSoundsMuted = true
-        _perfSoundAcc = 0
+)
+local auraMaintainToggle = MiscTab:Toggle(
+    "Keep selected aura on",
+    "Every ~4s (and after respawn / post-ascend keep): if equipped ≠ preferred, fires SelectAura(preferred).",
+    states.auraMaintainSelection,
+    function(on)
+        states.auraMaintainSelection = on == true
+        saveSettings()
+        SLbl.Text = on and "Aura: maintain ON" or "Aura: maintain OFF"
     end
-    SLbl.Text = on and "Perf: world sounds muted" or "Perf: world sounds restored"
+)
+MiscTab:Button("↻", "Refresh aura list", "GetUnlockedAuras → repopulates dropdown", C.sub, function()
+    local names = fetchUnlockedAuraNamesSorted()
+    auraPreferredDropdown.Refresh(buildAuraDropdownOptions(names), states.auraPreferredName)
+    SLbl.Text = (#names > 0) and ("✓ Aura list: " .. tostring(#names)) or "⚠ GetUnlockedAuras failed or empty"
 end)
-perfUi.shadow = MiscTab:Toggle("Disable Global Shadows", "Lighting.GlobalShadows = false while ON (restores prior when off) — saved", states.perfDisableShadows, function(on)
-    states.perfDisableShadows = on == true
-    saveSettings()
-    perfApplyShadows(on == true)
-    SLbl.Text = on and "Perf: shadows OFF" or "Perf: shadows restored"
-end)
-perfUi.tech = MiscTab:Toggle("Compatibility Lighting", "Lighting.Technology → Compatibility (older/cheaper pipeline; restores when off) — saved", states.perfCompatLighting, function(on)
-    states.perfCompatLighting = on == true
-    saveSettings()
-    perfApplyCompatLighting(on == true)
-    SLbl.Text = on and "Perf: Compatibility lighting" or "Perf: lighting tech restored"
-end)
-perfUi.lowq = MiscTab:Toggle("Low graphics quality", "UserSettings → UserGameSettings: SavedQualityLevel (lowest enum) + GraphicsQualityLevel=1 if present. Some executors ignore this — saved", states.perfLowGraphicsQuality, function(on)
-    states.perfLowGraphicsQuality = on == true
-    saveSettings()
-    perfApplyLowGraphicsQuality(on == true)
-    SLbl.Text = on and "Perf: low quality applied" or "Perf: graphics quality restored"
-end)
-perfUi.hidechars = MiscTab:Toggle("Hide other players’ characters", "INTRUSIVE: LocalTransparencyModifier on every other player’s Character BasePart (you see nobody). Yours unchanged — saved", states.perfHideOtherCharacters, function(on)
-    states.perfHideOtherCharacters = on == true
-    saveSettings()
-    if on == true then pcall(function() perfSweepOtherCharacters(true) end) end
-    SLbl.Text = on and "Perf: other characters hidden" or "Perf: other characters visible"
+MiscTab:Button("✓", "Equip preferred now", "SelectAura only if equipped ≠ preferred and aura is unlocked", C.accent, function()
+    local r = forceSelectPreferredAuraNow()
+    if r == "fired" then
+        SLbl.Text = "✓ SelectAura → " .. tostring(states.auraPreferredName)
+    elseif r == "already" then
+        SLbl.Text = "✓ Aura already equipped: " .. tostring(states.auraPreferredName)
+    else
+        SLbl.Text = "⚠ Equip failed — set preferred, Refresh list, ensure unlocked"
+    end
 end)
 task.defer(function()
     pcall(function()
-        local p = perfUi
-        if p.other and p.other.Set then p.other.Set(states.perfHideOtherWeapons) end
-        if p.own and p.own.Set then p.own.Set(states.perfHideOwnWeapons) end
-        if p.fx and p.fx.Set then p.fx.Set(states.perfHideAllEffects) end
-        if p.loot and p.loot.Set then p.loot.Set(states.perfHideLootDrops) end
-        if p.sound and p.sound.Set then p.sound.Set(states.perfMuteWorldSounds) end
-        if p.shadow and p.shadow.Set then p.shadow.Set(states.perfDisableShadows) end
-        if p.tech and p.tech.Set then p.tech.Set(states.perfCompatLighting) end
-        if p.lowq and p.lowq.Set then p.lowq.Set(states.perfLowGraphicsQuality) end
-        if p.hidechars and p.hidechars.Set then p.hidechars.Set(states.perfHideOtherCharacters) end
-        if states.perfDisableShadows then perfApplyShadows(true) end
-        if states.perfCompatLighting then perfApplyCompatLighting(true) end
-        if states.perfLowGraphicsQuality then perfApplyLowGraphicsQuality(true) end
-        if states.perfMuteWorldSounds then
-            pcall(perfSweepWorldSoundsMute)
-            _perfLastSoundsMuted = true
-            _perfSoundAcc = 0
+        local names = fetchUnlockedAuraNamesSorted()
+        auraPreferredDropdown.Refresh(buildAuraDropdownOptions(names), states.auraPreferredName)
+        if auraMaintainToggle and auraMaintainToggle.Set then
+            auraMaintainToggle.Set(states.auraMaintainSelection)
         end
-        if states.perfHideLootDrops then pcall(function() perfSweepLootDrops(true) end) end
-        if states.perfHideAllEffects then
+    end)
+end)
+
+-- `;` required before `(` here: otherwise Luau parses `(function` as a call on task.defer's return value.
+;(function()
+    MiscTab:Section("Machines (workspace.Machines)")
+    MiscTab:Label("Open via ProximityPrompt only — no teleport (needs executor fireproximityprompt).")
+
+    local MACHINE_NAMES = { "Fountain Of Skill", "Fusion Machine", "Totem Of Fortune", "Weapon Crafter" }
+    for _, mn in ipairs(MACHINE_NAMES) do
+        MiscTab:Button("🔧", mn, "Fire " .. mn .. " ProximityPrompt from range (no TP)", C.accent, function()
+            local machines = workspace:FindFirstChild("Machines")
+            local machine = machines and machines:FindFirstChild(mn)
+            if not machine then SLbl.Text = "⚠ " .. mn .. " not found in workspace.Machines"; return end
+            local prompt = machine:FindFirstChild("ProximityPrompt")
+            if prompt then
+                local ok = pcall(function() fireproximityprompt(prompt) end)
+                SLbl.Text = ok and ("✓ Opened: " .. mn) or ("⚠ fireproximityprompt failed — " .. mn)
+            else
+                SLbl.Text = "⚠ No ProximityPrompt on " .. mn
+            end
+        end)
+    end
+
+    MiscTab:Section("Game UI")
+    MiscTab:Toggle("👁️ Show AutoRaid Button", "Keeps AutoRaidBtn visible — saved & applied on load", states.showAutoRaid, function(on)
+        states.showAutoRaid = on; saveSettings()
+        pcall(function()
+            LP.PlayerGui:WaitForChild("MainGUI", 3)
+                :WaitForChild("OptionsList", 3)
+                :WaitForChild("AutoRaidBtn", 3).Visible = on
+        end)
+        SLbl.Text = on and "✓ AutoRaidBtn shown" or "AutoRaidBtn hidden"
+    end)
+    MiscTab:Toggle("🙈 Show HideMobs Button", "Keeps HideMobsBtn visible — saved & applied on load", states.showHideMobs, function(on)
+        states.showHideMobs = on; saveSettings()
+        pcall(function()
+            LP.PlayerGui:WaitForChild("MainGUI", 3)
+                :WaitForChild("OptionsList", 3)
+                :WaitForChild("HideMobsBtn", 3).Visible = on
+        end)
+        SLbl.Text = on and "✓ HideMobsBtn shown" or "HideMobsBtn hidden"
+    end)
+
+    MiscTab:Section("Performance")
+    MiscTab:Label("Client-only FPS helpers. Does not change server / combat hitboxes.")
+    local perfUi = {}
+    perfUi.other = MiscTab:Toggle("Hide Other Players' Weapons", "LocalTransparencyModifier on models under workspace[their name] — saved", states.perfHideOtherWeapons, function(on)
+        states.perfHideOtherWeapons = on == true
+        saveSettings()
+        SLbl.Text = on and "Perf: others’ weapons hidden" or "Perf: others’ weapons shown"
+    end)
+    perfUi.own = MiscTab:Toggle("Hide Own Weapons", "Hides models under your workspace player folder (same place as hitbox pulse) — saved", states.perfHideOwnWeapons, function(on)
+        states.perfHideOwnWeapons = on == true
+        saveSettings()
+        SLbl.Text = on and "Perf: your weapons hidden" or "Perf: your weapons shown"
+    end)
+    perfUi.fx = MiscTab:Toggle("Hide All Effects", "Disables ParticleEmitter, Trail, Beam under workspace (restores prior Enabled when off) — saved", states.perfHideAllEffects, function(on)
+        states.perfHideAllEffects = on == true
+        saveSettings()
+        if on == true then
             pcall(perfSweepEffectsHide)
             _perfLastEffectsHidden = true
             _perfFxAcc = 0
         end
-        if states.perfHideOtherCharacters then pcall(function() perfSweepOtherCharacters(true) end) end
+        SLbl.Text = on and "Perf: workspace VFX off" or "Perf: workspace VFX restored"
     end)
-end)
-
-MiscTab:Section("Upgrades (debug)")
-local UPGRADE_NAMES = {
-    "Weapons Equipped","Damage Multiplier","Enemy Spawn Rate","Enemy Limit",
-    "Mana Multiplier","Spin Speed","RNG Luck","Kill Multiplier",
-    "Skill Point Multiplier","Boss Spawn Chance"
-}
-MiscTab:Button("📊", "Print Upgrade Levels", "Fetches all upgrade levels via GetUnlockedUpgrades", C.accent, function()
-    local upgrades = invokeR("GetUnlockedUpgrades")
-    if not upgrades then SLbl.Text = "⚠ GetUnlockedUpgrades returned nil"; return end
-    for _, name in ipairs(UPGRADE_NAMES) do
-        local level = upgReadUpgradeLevel(name)
-        local val   = invokeR("GetUpgradeValue", name) or 0
-        print(string.format("[MeleeRNG] %-30s  Lv%d  Value: %s", name, level, tostring(val)))
-    end
-    SLbl.Text = "Upgrade levels printed to output"
-end)
-
-MiscTab:Section("Mana → SP")
-local manaToSpToggle = MiscTab:Toggle("⚡ Auto Mana → SP", "Convert 1 mana step at a time as fast as the server allows (~10/s). Saved with settings.", states.autoManaToSP, function(on)
-    states.autoManaToSP = on == true
-    saveSettings()
-    SLbl.Text = on and "Auto Mana→SP ON" or "Auto Mana→SP OFF"
-end)
-task.defer(function()
-    pcall(function()
-        if manaToSpToggle and manaToSpToggle.Set then
-            manaToSpToggle.Set(states.autoManaToSP)
-        end
-    end)
-end)
-
--- `do` block: drops inner locals at end so Luau stays under the 200 local-register limit per chunk.
-local guildSpToGpToggle, guildBuffAutoToggle, guildBuffToggles
-do
-GuildTab:Section("Status")
-guildStatusLbl = GuildTab:Label("Guild: — (join/create in game)")
-GuildTab:Label("Remotes: BuyGP(spAmount) · BuyGuildBuff(guildId, buff). Buffs match GuildConstants.")
-
-GuildTab:Section("SP → GP")
-guildSpToGpToggle = GuildTab:Toggle("💠 Auto SP → GP", "In a guild as member: calls BuyGP with (SP − reserve) ~2/s. Same as Add GP page SP box — saved.", states.autoGuildSpToGp, function(on)
-    states.autoGuildSpToGp = on == true
-    saveSettings()
-    SLbl.Text = on and "Guild: Auto SP→GP ON" or "Guild: Auto SP→GP OFF"
-end)
-GuildTab:Slider("Reserve SP", "Never spend below this much SP when Auto SP→GP runs (saved)", {
-    min = 0, max = 100000000, default = math.clamp(states.guildSpReserve, 0, 100000000),
-    format = function(v) return string.format("keep %s SP", tostring(math.floor(v))) end,
-}, function(v)
-    states.guildSpReserve = math.clamp(math.floor(v), 0, 100000000)
-    saveSettings()
-end)
-GuildTab:Button("➕", "SP → GP once", "BuyGP(current SP minus reserve) one shot", C.accent, function()
-    if not R("BuyGP") then SLbl.Text = "⚠ BuyGP remote missing"; return end
-    local g = fetchGuildState()
-    if not g or not guildPlayerIsMember(g) then SLbl.Text = "⚠ Not in a guild"; return end
-    local sp = tonumber(getSP()) or 0
-    local reserve = math.max(0, math.floor(tonumber(states.guildSpReserve) or 0))
-    local spend = math.floor(sp - reserve)
-    if spend <= 0 then SLbl.Text = "⚠ No SP to spend (check reserve)"; return end
-    invokeR("BuyGP", spend)
-    _cachedStats["SP"] = nil
-    SLbl.Text = "✓ BuyGP(" .. tostring(spend) .. " SP)"
-end)
-
-GuildTab:Section("Buff upgrades")
-guildBuffAutoToggle = GuildTab:Toggle("⚔️ Auto guild buff upgrades", "Guild owner only. Each tick buys the cheapest affordable buff among the toggles below — saved.", states.autoGuildBuffs, function(on)
-    states.autoGuildBuffs = on == true
-    saveSettings()
-    SLbl.Text = on and "Guild: Auto buffs ON" or "Guild: Auto buffs OFF"
-end)
-GuildTab:Label("Buff targets (ON = included; auto picks cheapest):")
-guildBuffToggles = {}
-for _, gn in ipairs(GUILD_BUFF_ORDER) do
-    guildBuffToggles[gn] = GuildTab:Toggle(gn, "Allow auto guild upgrade to buy this buff — saved", guildBuffSelected[gn] == true, function(on)
-        guildBuffSelected[gn] = (on == true)
+    perfUi.loot = MiscTab:Toggle("Hide Loot Drops", "Hides dropped weapons under workspace.Loot (client visibility only) — saved", states.perfHideLootDrops, function(on)
+        states.perfHideLootDrops = on == true
         saveSettings()
+        if on == true then pcall(function() perfSweepLootDrops(true) end) end
+        SLbl.Text = on and "Perf: loot hidden" or "Perf: loot visible"
     end)
-end
-GuildTab:Button("✅", "Buffs: all / none", "Flip every guild buff target on or off at once — saved", C.green, function()
-    local anyOff = false
-    for _, n in ipairs(GUILD_BUFF_ORDER) do
-        if not guildBuffSelected[n] then anyOff = true; break end
-    end
-    local turnOn = anyOff
-    for _, n in ipairs(GUILD_BUFF_ORDER) do
-        guildBuffSelected[n] = turnOn
-        local tr = guildBuffToggles[n]
-        if tr and tr.Set then pcall(function() tr.Set(turnOn) end) end
-    end
-    saveSettings()
-    SLbl.Text = turnOn and "Guild buffs: all ON" or "Guild buffs: all OFF"
-end)
-
-task.defer(function()
-    pcall(function()
-        if guildSpToGpToggle and guildSpToGpToggle.Set then guildSpToGpToggle.Set(states.autoGuildSpToGp) end
-        if guildBuffAutoToggle and guildBuffAutoToggle.Set then guildBuffAutoToggle.Set(states.autoGuildBuffs) end
-        for _, gn in ipairs(GUILD_BUFF_ORDER) do
-            local tr = guildBuffToggles[gn]
-            if tr and tr.Set then tr.Set(guildBuffSelected[gn] == true) end
-        end
-    end)
-end)
-end -- guild UI block (register limit)
-
-local apAutoToggle, apUpgradeToggles
-do
-ApTab:Section("Ascend Points upgrades")
-apStatusLbl = ApTab:Label("Ascend Points: —")
-ApTab:Label("SharedConstants.AscendUpgrades · Remotes: GetAscendPoints, GetAscendUpgrades, UpgradeAscend(name). Max L10.")
-apAutoToggle = ApTab:Toggle("⚡ Auto AP upgrades", "Buys the cheapest affordable upgrade among toggled rows (~1.2s). Saved.", states.autoApUpgrades, function(on)
-    states.autoApUpgrades = on == true
-    saveSettings()
-    SLbl.Text = on and "Ascend AP: auto ON" or "Ascend AP: auto OFF"
-end)
-ApTab:Label("Include in auto (cheapest among ON):")
-apUpgradeToggles = {}
-for _, an in ipairs(ASCEND_AP_ORDER) do
-    apUpgradeToggles[an] = ApTab:Toggle(an, "Allow auto to purchase this AP statue upgrade — saved", apUpgradeSelected[an] == true, function(on)
-        apUpgradeSelected[an] = (on == true)
+    perfUi.sound = MiscTab:Toggle("Mute World Sounds", "Sets workspace Sound.Volume to 0 (restores when off). Throttled rescans for new sounds — saved", states.perfMuteWorldSounds, function(on)
+        states.perfMuteWorldSounds = on == true
         saveSettings()
+        if on == true then
+            pcall(perfSweepWorldSoundsMute)
+            _perfLastSoundsMuted = true
+            _perfSoundAcc = 0
+        end
+        SLbl.Text = on and "Perf: world sounds muted" or "Perf: world sounds restored"
     end)
-end
-ApTab:Button("✅", "AP upgrades: all / none", "Flip every AP upgrade toggle — saved", C.green, function()
-    local anyOff = false
-    for _, n in ipairs(ASCEND_AP_ORDER) do
-        if not apUpgradeSelected[n] then anyOff = true; break end
-    end
-    local turnOn = anyOff
-    for _, n in ipairs(ASCEND_AP_ORDER) do
-        apUpgradeSelected[n] = turnOn
-        local tr = apUpgradeToggles[n]
-        if tr and tr.Set then pcall(function() tr.Set(turnOn) end) end
-    end
-    saveSettings()
-    SLbl.Text = turnOn and "AP upgrades: all ON" or "AP upgrades: all OFF"
-end)
-ApTab:Button("⬆️", "Upgrade once (cheapest)", "Single UpgradeAscend for cheapest affordable row that is toggled ON", C.accent, function()
-    if not R("UpgradeAscend") then SLbl.Text = "⚠ UpgradeAscend missing"; return end
-    local levels = invokeR("GetAscendUpgrades")
-    if type(levels) ~= "table" then SLbl.Text = "⚠ GetAscendUpgrades failed"; return end
-    local ap = parseAscendPoints(invokeR("GetAscendPoints"))
-    local rows = {}
-    for _, name in ipairs(ASCEND_AP_ORDER) do
-        if apUpgradeSelected[name] ~= true then continue end
-        local lvl = tonumber(levels[name]) or 0
-        if lvl >= ASCEND_AP_MAX_LEVEL then continue end
-        local cost = ascendApNextCost(name, lvl)
-        if type(cost) == "number" and cost == cost and cost > 0 and cost < math.huge then
-            rows[#rows + 1] = { name = name, cost = cost }
-        end
-    end
-    table.sort(rows, function(a, b) return a.cost < b.cost end)
-    for _, row in ipairs(rows) do
-        if ap < row.cost then SLbl.Text = string.format("⚠ Need %d AP for %s", row.cost, row.name); return end
-        local ok, newLevel = invokeR2("UpgradeAscend", row.name)
-        if ok and type(newLevel) == "number" then
-            SLbl.Text = "✓ " .. row.name .. " → L" .. tostring(newLevel)
-            return
-        end
-    end
-    SLbl.Text = "⚠ No upgrade bought (maxed or server rejected)"
-end)
-task.defer(function()
-    pcall(function()
-        if apAutoToggle and apAutoToggle.Set then apAutoToggle.Set(states.autoApUpgrades) end
-        for _, an in ipairs(ASCEND_AP_ORDER) do
-            local tr = apUpgradeToggles[an]
-            if tr and tr.Set then tr.Set(apUpgradeSelected[an] == true) end
-        end
+    perfUi.shadow = MiscTab:Toggle("Disable Global Shadows", "Lighting.GlobalShadows = false while ON (restores prior when off) — saved", states.perfDisableShadows, function(on)
+        states.perfDisableShadows = on == true
+        saveSettings()
+        perfApplyShadows(on == true)
+        SLbl.Text = on and "Perf: shadows OFF" or "Perf: shadows restored"
     end)
-end)
-end -- Ascend AP UI block (register limit)
+    perfUi.tech = MiscTab:Toggle("Compatibility Lighting", "Lighting.Technology → Compatibility (older/cheaper pipeline; restores when off) — saved", states.perfCompatLighting, function(on)
+        states.perfCompatLighting = on == true
+        saveSettings()
+        perfApplyCompatLighting(on == true)
+        SLbl.Text = on and "Perf: Compatibility lighting" or "Perf: lighting tech restored"
+    end)
+    perfUi.lowq = MiscTab:Toggle("Low graphics quality", "UserSettings → UserGameSettings: SavedQualityLevel (lowest enum) + GraphicsQualityLevel=1 if present. Some executors ignore this — saved", states.perfLowGraphicsQuality, function(on)
+        states.perfLowGraphicsQuality = on == true
+        saveSettings()
+        perfApplyLowGraphicsQuality(on == true)
+        SLbl.Text = on and "Perf: low quality applied" or "Perf: graphics quality restored"
+    end)
+    perfUi.hidechars = MiscTab:Toggle("Hide other players’ characters", "INTRUSIVE: LocalTransparencyModifier on every other player’s Character BasePart (you see nobody). Yours unchanged — saved", states.perfHideOtherCharacters, function(on)
+        states.perfHideOtherCharacters = on == true
+        saveSettings()
+        if on == true then pcall(function() perfSweepOtherCharacters(true) end) end
+        SLbl.Text = on and "Perf: other characters hidden" or "Perf: other characters visible"
+    end)
+    task.defer(function()
+        pcall(function()
+            local p = perfUi
+            if p.other and p.other.Set then p.other.Set(states.perfHideOtherWeapons) end
+            if p.own and p.own.Set then p.own.Set(states.perfHideOwnWeapons) end
+            if p.fx and p.fx.Set then p.fx.Set(states.perfHideAllEffects) end
+            if p.loot and p.loot.Set then p.loot.Set(states.perfHideLootDrops) end
+            if p.sound and p.sound.Set then p.sound.Set(states.perfMuteWorldSounds) end
+            if p.shadow and p.shadow.Set then p.shadow.Set(states.perfDisableShadows) end
+            if p.tech and p.tech.Set then p.tech.Set(states.perfCompatLighting) end
+            if p.lowq and p.lowq.Set then p.lowq.Set(states.perfLowGraphicsQuality) end
+            if p.hidechars and p.hidechars.Set then p.hidechars.Set(states.perfHideOtherCharacters) end
+            if states.perfDisableShadows then perfApplyShadows(true) end
+            if states.perfCompatLighting then perfApplyCompatLighting(true) end
+            if states.perfLowGraphicsQuality then perfApplyLowGraphicsQuality(true) end
+            if states.perfMuteWorldSounds then
+                pcall(perfSweepWorldSoundsMute)
+                _perfLastSoundsMuted = true
+                _perfSoundAcc = 0
+            end
+            if states.perfHideLootDrops then pcall(function() perfSweepLootDrops(true) end) end
+            if states.perfHideAllEffects then
+                pcall(perfSweepEffectsHide)
+                _perfLastEffectsHidden = true
+                _perfFxAcc = 0
+            end
+            if states.perfHideOtherCharacters then pcall(function() perfSweepOtherCharacters(true) end) end
+        end)
+    end)
+
+    MiscTab:Section("Upgrades (debug)")
+    local UPGRADE_NAMES = {
+        "Weapons Equipped", "Damage Multiplier", "Enemy Spawn Rate", "Enemy Limit",
+        "Mana Multiplier", "Spin Speed", "RNG Luck", "Kill Multiplier",
+        "Skill Point Multiplier", "Boss Spawn Chance",
+    }
+    MiscTab:Button("📊", "Print Upgrade Levels", "Fetches all upgrade levels via GetUnlockedUpgrades", C.accent, function()
+        local upgrades = invokeR("GetUnlockedUpgrades")
+        if not upgrades then SLbl.Text = "⚠ GetUnlockedUpgrades returned nil"; return end
+        for _, name in ipairs(UPGRADE_NAMES) do
+            local level = upgReadUpgradeLevel(name)
+            local val = invokeR("GetUpgradeValue", name) or 0
+            print(string.format("[MeleeRNG] %-30s  Lv%d  Value: %s", name, level, tostring(val)))
+        end
+        SLbl.Text = "Upgrade levels printed to output"
+    end)
+
+    MiscTab:Section("Mana → SP")
+    local toggle = MiscTab:Toggle("⚡ Auto Mana → SP", "Requires mana ≥ CalculateManaPrice(1). If ConvertMana returns false (cap / can’t afford more SP), waits ~5s before retry — avoids spam toasts.", states.autoManaToSP, function(on)
+        states.autoManaToSP = on == true
+        saveSettings()
+        SLbl.Text = on and "Auto Mana→SP ON" or "Auto Mana→SP OFF"
+    end)
+    task.defer(function()
+        pcall(function()
+            if toggle and toggle.Set then toggle.Set(states.autoManaToSP) end
+        end)
+    end)
+    manaToSpToggle = toggle
+
+    local g = meleeGuiMountGuildTab(GuildTab, SLbl, C)
+    guildStatusLbl = g.guildStatusLbl
+    guildSpToGpToggle = g.guildSpToGpToggle
+    guildBuffAutoToggle = g.guildBuffAutoToggle
+    guildBuffToggles = g.guildBuffToggles
+    local a = meleeGuiMountApTab(ApTab, SLbl, C)
+    apStatusLbl = a.apStatusLbl
+    apAutoToggle = a.apAutoToggle
+    apUpgradeToggles = a.apUpgradeToggles
+end)()
 
 MiscTab:Section("Community")
 MiscTab:Button("💬", "Join Discord", "Opens discord.gg/ErGUHtVK in browser", C.purple, function()
@@ -3658,12 +3995,13 @@ MiscTab:Button("💾", "Save Settings", "Force-saves current toggle/slider state
     SLbl.Text = "Settings saved to " .. SETTINGS_FILE
 end)
 
--- ── Auto re-exec (queue_on_teleport + OnTeleport) ────────────────────────────
--- Some executors re-fire queued scripts immediately or stack queues — debounce + single load arm.
-do
-    local REEXEC_URL = SCRIPT_URL
-    local QUEUE_MIN_INTERVAL = 12  -- seconds between queue_on_teleport calls (same session / gen)
+return SLbl
+end)()
 
+-- ── Auto re-exec (own function = avoids Luau 200 locals in UI IIFE) ───────────
+local function meleeReexecArmInit()
+    local reexecUrl = SCRIPT_URL
+    local queueMinInterval = 12
     if _G.MeleeRNG_AutoRejoin and not states.autoReExec then
         states.autoReExec = true
         saveSettings()
@@ -3672,20 +4010,18 @@ do
         _G.MeleeRNG_AutoRejoin = states.autoReExec
     end
     syncMeleeRejoinFlag()
-
-    local function armQueue(reason)
+    local function armQueue(_reason)
         if not queue_on_teleport or not states.autoReExec then return end
         local now = os.clock()
         local last = _G.MeleeRNG_QueueLastClock
-        if type(last) == "number" and (now - last) < QUEUE_MIN_INTERVAL then
+        if type(last) == "number" and (now - last) < queueMinInterval then
             return
         end
         _G.MeleeRNG_QueueLastClock = now
         pcall(function()
-            queue_on_teleport('loadstring(game:HttpGet("' .. REEXEC_URL .. '",true))()')
+            queue_on_teleport('loadstring(game:HttpGet("' .. reexecUrl .. '",true))()')
         end)
     end
-
     pcall(function()
         LP.OnTeleport:Connect(function(teleportState)
             if teleportState ~= Enum.TeleportState.RequestedByServer then return end
@@ -3694,14 +4030,10 @@ do
             armQueue("teleport")
         end)
     end)
-
-    -- Arm once if already ON from settings (do not double-arm via the poller below)
     if states.autoReExec then
         armQueue("load")
     end
-
     task.spawn(function()
-        -- Match saved state so we don't fire armQueue again 2s later on every load
         local wasOn = states.autoReExec == true
         while true do
             if GEN ~= _G.MeleeRNG_Gen then break end
@@ -3713,12 +4045,9 @@ do
             wasOn = states.autoReExec == true
         end
     end)
-
     _G.MeleeRNG_ArmReexecQueue = armQueue
 end
-
-return SLbl
-end)()
+meleeReexecArmInit()
 
 -- ============================================================
 --  DONE
