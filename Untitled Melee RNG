@@ -46,6 +46,12 @@ if not LP then error("[MeleeRNG] LocalPlayer not ready") end
 _G.MeleeRNG_Gen = (_G.MeleeRNG_Gen or 0) + 1
 local GEN = _G.MeleeRNG_Gen
 
+-- OFF = no [MeleeRNG/Sac] / Totem spam in F9 (same logic; only console output gated).
+local MeleeRNG_VERBOSE_CONSOLE = false
+local function vprint(...)
+    if MeleeRNG_VERBOSE_CONSOLE then print(...) end
+end
+
 -- ── Cleanup system ────────────────────────────────────────────
 local _conns    = {}
 local _threads  = {}
@@ -372,6 +378,8 @@ local states = {
     perfHideLootDrops    = false, -- workspace.Loot (dump LootController)
     perfMuteWorldSounds  = false, -- Sound instances under workspace
     perfCompatLighting   = false, -- Lighting.Technology → Compatibility
+    perfLowGraphicsQuality = false, -- UserGameSettings quality (executor/client dependent)
+    perfHideOtherCharacters = false, -- other players’ Character rigs invisible locally (intrusive)
 }
 
 -- Upgrade names for save/load (must exist before saveSettings references upgradeSelected)
@@ -534,6 +542,8 @@ states.perfDisableShadows = states.perfDisableShadows == true
 states.perfHideLootDrops = states.perfHideLootDrops == true
 states.perfMuteWorldSounds = states.perfMuteWorldSounds == true
 states.perfCompatLighting = states.perfCompatLighting == true
+states.perfLowGraphicsQuality = states.perfLowGraphicsQuality == true
+states.perfHideOtherCharacters = states.perfHideOtherCharacters == true
 states.guildSpReserve = math.clamp(math.floor(tonumber(states.guildSpReserve) or 0), 0, 100000000)
 -- Totem CD/cap from LS applied in totem block (after TOTEM_CYCLE_SEC) + sanitize vs os.time()
 
@@ -1616,7 +1626,7 @@ local function refreshSacInventory()
     for _, w in ipairs(_sacInv) do
         local tl = select(1, sacTierFromOneIn(w.oneIn))
         local oi = (w.oneIn and w.oneIn < 1e15) and math.floor(w.oneIn) or -1
-        print(string.format("[MeleeRNG/Sac] [OK] %-32s x%-4d  Rank=%-3s  Dmg=%-8s  OneIn=%-10s  %s  | %s",
+        vprint(string.format("[MeleeRNG/Sac] [OK] %-32s x%-4d  Rank=%-3s  Dmg=%-8s  OneIn=%-10s  %s  | %s",
             w.name, w.qty, tostring(w.rank), tostring(w.damage), oi >= 0 and tostring(oi) or "?", w.type, tl))
     end
     rebuildSacWeaponRows()
@@ -1690,7 +1700,7 @@ local function totemExecuteNext()
     _totemLastConfirmClock = os.clock()
     -- Cobalt-style: one string = that row's inventory weapon name.
     local remoteName = totemRemoteWeaponName(w.name)
-    print(string.format("[MeleeRNG/Totem] %d/%d in color · inv=%q -> send=%q", idx, nCand, w.name, remoteName))
+    vprint(string.format("[MeleeRNG/Totem] %d/%d in color · inv=%q -> send=%q", idx, nCand, w.name, remoteName))
     local invokeOk, res = pcall(function() return tr:InvokeServer(remoteName) end)
     if not invokeOk then
         invokeOk, res = pcall(function() return tr:InvokeServer(remoteName, w.type) end)
@@ -2156,6 +2166,77 @@ local _perfSoundVol = {} -- [Sound] = prior Volume
 local _perfSoundAcc = 0
 local _perfSavedGlobalShadows = nil -- bool | nil
 local _perfSavedTechnology = nil    -- Enum.Technology | nil
+local _perfSavedQualityLevel = nil          -- Enum.SavedQualitySetting | nil
+local _perfSavedGraphicsQualityLevel = nil  -- number | nil
+local _perfCharLTM = {} -- [BasePart] = prior LTM for other players’ characters
+
+local function perfApplyLowGraphicsQuality(on)
+    local ok, ugs = pcall(function()
+        return UserSettings():GetService("UserGameSettings")
+    end)
+    if not ok or ugs == nil then return end
+    if on then
+        if _perfSavedQualityLevel == nil then
+            pcall(function() _perfSavedQualityLevel = ugs.SavedQualityLevel end)
+        end
+        if _perfSavedGraphicsQualityLevel == nil then
+            pcall(function()
+                local v = ugs.GraphicsQualityLevel
+                if type(v) == "number" then _perfSavedGraphicsQualityLevel = v end
+            end)
+        end
+        -- Roblox uses QualityLevel01 … QualityLevel21 (01 = lowest). Some builds omit leading zero.
+        pcall(function()
+            local e = Enum.SavedQualitySetting
+            local low = e.QualityLevel01 or e.QualityLevel02 or e.QualityLevel03
+            if low then ugs.SavedQualityLevel = low end
+        end)
+        pcall(function() ugs.GraphicsQualityLevel = 1 end)
+    else
+        if _perfSavedQualityLevel ~= nil then
+            local v = _perfSavedQualityLevel
+            _perfSavedQualityLevel = nil
+            pcall(function() ugs.SavedQualityLevel = v end)
+        end
+        if _perfSavedGraphicsQualityLevel ~= nil then
+            local v = _perfSavedGraphicsQualityLevel
+            _perfSavedGraphicsQualityLevel = nil
+            pcall(function() ugs.GraphicsQualityLevel = v end)
+        end
+    end
+end
+
+local function perfCleanupStaleCharKeys()
+    for p in pairs(_perfCharLTM) do
+        if not (p and p.Parent) then _perfCharLTM[p] = nil end
+    end
+end
+
+local function perfSweepOtherCharacters(hide)
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LP then
+            local ch = plr.Character
+            if ch then
+                for _, d in ipairs(ch:GetDescendants()) do
+                    if d:IsA("BasePart") then
+                        if hide then
+                            if _perfCharLTM[d] == nil then
+                                _perfCharLTM[d] = d.LocalTransparencyModifier
+                            end
+                            d.LocalTransparencyModifier = 1
+                        else
+                            local prev = _perfCharLTM[d]
+                            if prev ~= nil then
+                                d.LocalTransparencyModifier = prev
+                                _perfCharLTM[d] = nil
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
 
 local function perfApplyShadows(disable)
     if disable then
@@ -2316,7 +2397,8 @@ addThread(task.spawn(function()
         local ef = states.perfHideAllEffects
         local lo = states.perfHideLootDrops
         local ws = states.perfMuteWorldSounds
-        if not ow and not sw and not ef and not lo and not ws then
+        local oc = states.perfHideOtherCharacters
+        if not ow and not sw and not ef and not lo and not ws and not oc then
             if _perfLastEffectsHidden then
                 perfRestoreEffects()
                 _perfLastEffectsHidden = false
@@ -2324,6 +2406,8 @@ addThread(task.spawn(function()
             _perfFxAcc = 0
             perfRestoreAllWeaponFolders()
             perfRestoreAllLoot()
+            perfSweepOtherCharacters(false)
+            perfCleanupStaleCharKeys()
             if _perfLastSoundsMuted then
                 perfRestoreAllWorldSounds()
                 _perfLastSoundsMuted = false
@@ -2382,6 +2466,12 @@ addThread(task.spawn(function()
             _perfLastSoundsMuted = false
             _perfSoundAcc = 0
         end
+        if oc then
+            perfSweepOtherCharacters(true)
+        else
+            perfSweepOtherCharacters(false)
+        end
+        perfCleanupStaleCharKeys()
     end
 end))
 
@@ -3217,17 +3307,19 @@ end)
 
 MiscTab:Section("Performance")
 MiscTab:Label("Client-only FPS helpers. Does not change server / combat hitboxes.")
-local perfOtherToggle = MiscTab:Toggle("Hide Other Players' Weapons", "LocalTransparencyModifier on models under workspace[their name] — saved", states.perfHideOtherWeapons, function(on)
+-- One table keeps Luau main-chunk local register count under the 200 limit (executor compile error).
+local perfUi = {}
+perfUi.other = MiscTab:Toggle("Hide Other Players' Weapons", "LocalTransparencyModifier on models under workspace[their name] — saved", states.perfHideOtherWeapons, function(on)
     states.perfHideOtherWeapons = on == true
     saveSettings()
     SLbl.Text = on and "Perf: others’ weapons hidden" or "Perf: others’ weapons shown"
 end)
-local perfOwnToggle = MiscTab:Toggle("Hide Own Weapons", "Hides models under your workspace player folder (same place as hitbox pulse) — saved", states.perfHideOwnWeapons, function(on)
+perfUi.own = MiscTab:Toggle("Hide Own Weapons", "Hides models under your workspace player folder (same place as hitbox pulse) — saved", states.perfHideOwnWeapons, function(on)
     states.perfHideOwnWeapons = on == true
     saveSettings()
     SLbl.Text = on and "Perf: your weapons hidden" or "Perf: your weapons shown"
 end)
-local perfFxToggle = MiscTab:Toggle("Hide All Effects", "Disables ParticleEmitter, Trail, Beam under workspace (restores prior Enabled when off) — saved", states.perfHideAllEffects, function(on)
+perfUi.fx = MiscTab:Toggle("Hide All Effects", "Disables ParticleEmitter, Trail, Beam under workspace (restores prior Enabled when off) — saved", states.perfHideAllEffects, function(on)
     states.perfHideAllEffects = on == true
     saveSettings()
     if on == true then
@@ -3237,13 +3329,13 @@ local perfFxToggle = MiscTab:Toggle("Hide All Effects", "Disables ParticleEmitte
     end
     SLbl.Text = on and "Perf: workspace VFX off" or "Perf: workspace VFX restored"
 end)
-local perfLootToggle = MiscTab:Toggle("Hide Loot Drops", "Hides dropped weapons under workspace.Loot (client visibility only) — saved", states.perfHideLootDrops, function(on)
+perfUi.loot = MiscTab:Toggle("Hide Loot Drops", "Hides dropped weapons under workspace.Loot (client visibility only) — saved", states.perfHideLootDrops, function(on)
     states.perfHideLootDrops = on == true
     saveSettings()
     if on == true then pcall(function() perfSweepLootDrops(true) end) end
     SLbl.Text = on and "Perf: loot hidden" or "Perf: loot visible"
 end)
-local perfSoundToggle = MiscTab:Toggle("Mute World Sounds", "Sets workspace Sound.Volume to 0 (restores when off). Throttled rescans for new sounds — saved", states.perfMuteWorldSounds, function(on)
+perfUi.sound = MiscTab:Toggle("Mute World Sounds", "Sets workspace Sound.Volume to 0 (restores when off). Throttled rescans for new sounds — saved", states.perfMuteWorldSounds, function(on)
     states.perfMuteWorldSounds = on == true
     saveSettings()
     if on == true then
@@ -3253,29 +3345,45 @@ local perfSoundToggle = MiscTab:Toggle("Mute World Sounds", "Sets workspace Soun
     end
     SLbl.Text = on and "Perf: world sounds muted" or "Perf: world sounds restored"
 end)
-local perfShadowToggle = MiscTab:Toggle("Disable Global Shadows", "Lighting.GlobalShadows = false while ON (restores prior when off) — saved", states.perfDisableShadows, function(on)
+perfUi.shadow = MiscTab:Toggle("Disable Global Shadows", "Lighting.GlobalShadows = false while ON (restores prior when off) — saved", states.perfDisableShadows, function(on)
     states.perfDisableShadows = on == true
     saveSettings()
     perfApplyShadows(on == true)
     SLbl.Text = on and "Perf: shadows OFF" or "Perf: shadows restored"
 end)
-local perfTechToggle = MiscTab:Toggle("Compatibility Lighting", "Lighting.Technology → Compatibility (older/cheaper pipeline; restores when off) — saved", states.perfCompatLighting, function(on)
+perfUi.tech = MiscTab:Toggle("Compatibility Lighting", "Lighting.Technology → Compatibility (older/cheaper pipeline; restores when off) — saved", states.perfCompatLighting, function(on)
     states.perfCompatLighting = on == true
     saveSettings()
     perfApplyCompatLighting(on == true)
     SLbl.Text = on and "Perf: Compatibility lighting" or "Perf: lighting tech restored"
 end)
+perfUi.lowq = MiscTab:Toggle("Low graphics quality", "UserSettings → UserGameSettings: SavedQualityLevel (lowest enum) + GraphicsQualityLevel=1 if present. Some executors ignore this — saved", states.perfLowGraphicsQuality, function(on)
+    states.perfLowGraphicsQuality = on == true
+    saveSettings()
+    perfApplyLowGraphicsQuality(on == true)
+    SLbl.Text = on and "Perf: low quality applied" or "Perf: graphics quality restored"
+end)
+perfUi.hidechars = MiscTab:Toggle("Hide other players’ characters", "INTRUSIVE: LocalTransparencyModifier on every other player’s Character BasePart (you see nobody). Yours unchanged — saved", states.perfHideOtherCharacters, function(on)
+    states.perfHideOtherCharacters = on == true
+    saveSettings()
+    if on == true then pcall(function() perfSweepOtherCharacters(true) end) end
+    SLbl.Text = on and "Perf: other characters hidden" or "Perf: other characters visible"
+end)
 task.defer(function()
     pcall(function()
-        if perfOtherToggle and perfOtherToggle.Set then perfOtherToggle.Set(states.perfHideOtherWeapons) end
-        if perfOwnToggle and perfOwnToggle.Set then perfOwnToggle.Set(states.perfHideOwnWeapons) end
-        if perfFxToggle and perfFxToggle.Set then perfFxToggle.Set(states.perfHideAllEffects) end
-        if perfLootToggle and perfLootToggle.Set then perfLootToggle.Set(states.perfHideLootDrops) end
-        if perfSoundToggle and perfSoundToggle.Set then perfSoundToggle.Set(states.perfMuteWorldSounds) end
-        if perfShadowToggle and perfShadowToggle.Set then perfShadowToggle.Set(states.perfDisableShadows) end
-        if perfTechToggle and perfTechToggle.Set then perfTechToggle.Set(states.perfCompatLighting) end
+        local p = perfUi
+        if p.other and p.other.Set then p.other.Set(states.perfHideOtherWeapons) end
+        if p.own and p.own.Set then p.own.Set(states.perfHideOwnWeapons) end
+        if p.fx and p.fx.Set then p.fx.Set(states.perfHideAllEffects) end
+        if p.loot and p.loot.Set then p.loot.Set(states.perfHideLootDrops) end
+        if p.sound and p.sound.Set then p.sound.Set(states.perfMuteWorldSounds) end
+        if p.shadow and p.shadow.Set then p.shadow.Set(states.perfDisableShadows) end
+        if p.tech and p.tech.Set then p.tech.Set(states.perfCompatLighting) end
+        if p.lowq and p.lowq.Set then p.lowq.Set(states.perfLowGraphicsQuality) end
+        if p.hidechars and p.hidechars.Set then p.hidechars.Set(states.perfHideOtherCharacters) end
         if states.perfDisableShadows then perfApplyShadows(true) end
         if states.perfCompatLighting then perfApplyCompatLighting(true) end
+        if states.perfLowGraphicsQuality then perfApplyLowGraphicsQuality(true) end
         if states.perfMuteWorldSounds then
             pcall(perfSweepWorldSoundsMute)
             _perfLastSoundsMuted = true
@@ -3287,6 +3395,7 @@ task.defer(function()
             _perfLastEffectsHidden = true
             _perfFxAcc = 0
         end
+        if states.perfHideOtherCharacters then pcall(function() perfSweepOtherCharacters(true) end) end
     end)
 end)
 
@@ -3321,12 +3430,15 @@ task.defer(function()
     end)
 end)
 
+-- `do` block: drops inner locals at end so Luau stays under the 200 local-register limit per chunk.
+local guildSpToGpToggle, guildBuffAutoToggle, guildBuffToggles
+do
 GuildTab:Section("Status")
 guildStatusLbl = GuildTab:Label("Guild: — (join/create in game)")
 GuildTab:Label("Remotes: BuyGP(spAmount) · BuyGuildBuff(guildId, buff). Buffs match GuildConstants.")
 
 GuildTab:Section("SP → GP")
-local guildSpToGpToggle = GuildTab:Toggle("💠 Auto SP → GP", "In a guild as member: calls BuyGP with (SP − reserve) ~2/s. Same as Add GP page SP box — saved.", states.autoGuildSpToGp, function(on)
+guildSpToGpToggle = GuildTab:Toggle("💠 Auto SP → GP", "In a guild as member: calls BuyGP with (SP − reserve) ~2/s. Same as Add GP page SP box — saved.", states.autoGuildSpToGp, function(on)
     states.autoGuildSpToGp = on == true
     saveSettings()
     SLbl.Text = on and "Guild: Auto SP→GP ON" or "Guild: Auto SP→GP OFF"
@@ -3352,13 +3464,13 @@ GuildTab:Button("➕", "SP → GP once", "BuyGP(current SP minus reserve) one sh
 end)
 
 GuildTab:Section("Buff upgrades")
-local guildBuffAutoToggle = GuildTab:Toggle("⚔️ Auto guild buff upgrades", "Guild owner only. Each tick buys the cheapest affordable buff among the toggles below — saved.", states.autoGuildBuffs, function(on)
+guildBuffAutoToggle = GuildTab:Toggle("⚔️ Auto guild buff upgrades", "Guild owner only. Each tick buys the cheapest affordable buff among the toggles below — saved.", states.autoGuildBuffs, function(on)
     states.autoGuildBuffs = on == true
     saveSettings()
     SLbl.Text = on and "Guild: Auto buffs ON" or "Guild: Auto buffs OFF"
 end)
 GuildTab:Label("Buff targets (ON = included; auto picks cheapest):")
-local guildBuffToggles = {}
+guildBuffToggles = {}
 for _, gn in ipairs(GUILD_BUFF_ORDER) do
     guildBuffToggles[gn] = GuildTab:Toggle(gn, "Allow auto guild upgrade to buy this buff — saved", guildBuffSelected[gn] == true, function(on)
         guildBuffSelected[gn] = (on == true)
@@ -3390,17 +3502,20 @@ task.defer(function()
         end
     end)
 end)
+end -- guild UI block (register limit)
 
+local apAutoToggle, apUpgradeToggles
+do
 ApTab:Section("Ascend Points upgrades")
 apStatusLbl = ApTab:Label("Ascend Points: —")
 ApTab:Label("SharedConstants.AscendUpgrades · Remotes: GetAscendPoints, GetAscendUpgrades, UpgradeAscend(name). Max L10.")
-local apAutoToggle = ApTab:Toggle("⚡ Auto AP upgrades", "Buys the cheapest affordable upgrade among toggled rows (~1.2s). Saved.", states.autoApUpgrades, function(on)
+apAutoToggle = ApTab:Toggle("⚡ Auto AP upgrades", "Buys the cheapest affordable upgrade among toggled rows (~1.2s). Saved.", states.autoApUpgrades, function(on)
     states.autoApUpgrades = on == true
     saveSettings()
     SLbl.Text = on and "Ascend AP: auto ON" or "Ascend AP: auto OFF"
 end)
 ApTab:Label("Include in auto (cheapest among ON):")
-local apUpgradeToggles = {}
+apUpgradeToggles = {}
 for _, an in ipairs(ASCEND_AP_ORDER) do
     apUpgradeToggles[an] = ApTab:Toggle(an, "Allow auto to purchase this AP statue upgrade — saved", apUpgradeSelected[an] == true, function(on)
         apUpgradeSelected[an] = (on == true)
@@ -3456,6 +3571,7 @@ task.defer(function()
         end
     end)
 end)
+end -- Ascend AP UI block (register limit)
 
 MiscTab:Section("Community")
 MiscTab:Button("💬", "Join Discord", "Opens discord.gg/ErGUHtVK in browser", C.purple, function()
@@ -3621,5 +3737,5 @@ task.defer(function()
         end)
     end
 end)
-print(string.format("[MeleeRNG] Loaded v1.0 | Gen=%d | DMGx=%d%%", GEN, _dmgMulti))
+vprint(string.format("[MeleeRNG] Loaded v1.0 | Gen=%d | DMGx=%d%%", GEN, _dmgMulti))
 SLbl.Text = string.format("MeleeRNG v1.0 ready | Gen=%d | Kills: %s", GEN, tostring(getKills()))
