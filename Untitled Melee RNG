@@ -364,6 +364,10 @@ local states = {
     totemCapFromServerNotify = false, -- "server confirmed" banner until CD ends
     -- Totem color = OneIn range; ticked rows = which names in that range may be sacrificed (like Cobalt)
     totemOnlyTickedNames    = false,
+    -- Client-only performance (no matching remotes in dump): spinning weapons live under workspace.[PlayerName]
+    perfHideOtherWeapons = false,
+    perfHideOwnWeapons   = false,
+    perfHideAllEffects   = false,
 }
 
 -- Upgrade names for save/load (must exist before saveSettings references upgradeSelected)
@@ -519,6 +523,9 @@ states.totemDoneThisCycle = math.max(0, math.floor(tonumber(states.totemDoneThis
 states.autoGuildSpToGp = states.autoGuildSpToGp == true
 states.autoGuildBuffs = states.autoGuildBuffs == true
 states.autoApUpgrades = states.autoApUpgrades == true
+states.perfHideOtherWeapons = states.perfHideOtherWeapons == true
+states.perfHideOwnWeapons = states.perfHideOwnWeapons == true
+states.perfHideAllEffects = states.perfHideAllEffects == true
 states.guildSpReserve = math.clamp(math.floor(tonumber(states.guildSpReserve) or 0), 0, 100000000)
 -- Totem CD/cap from LS applied in totem block (after TOTEM_CYCLE_SEC) + sanitize vs os.time()
 
@@ -2129,6 +2136,124 @@ local function rebuildHitboxCache()
     _hitboxCacheDirty = false
 end
 
+-- ── Performance (client): hide spinning weapon models + workspace VFX ───────
+-- Game puts equipped weapon clones under workspace[Player.Name] (see hitbox cache above).
+-- Dump references WeaponsClientController.ToggleWeaponVisibility but bytecode didn’t decompile.
+local _perfPartLTM = {} -- [BasePart] = prior LocalTransparencyModifier while hidden
+local _perfEffOn = {}   -- [ParticleEmitter|Trail|Beam] = prior Enabled while hidden
+local _perfLastEffectsHidden = false
+local _perfFxAcc = 0    -- throttle workspace:GetDescendants() sweeps (~every 5×0.12s)
+
+local function perfCleanupStalePartKeys()
+    for p in pairs(_perfPartLTM) do
+        if not (p and p.Parent) then _perfPartLTM[p] = nil end
+    end
+end
+
+local function perfSweepWeaponFolder(folder, hide)
+    if not folder then return end
+    for _, m in ipairs(folder:GetChildren()) do
+        if m:IsA("Model") then
+            for _, d in ipairs(m:GetDescendants()) do
+                if d:IsA("BasePart") then
+                    if hide then
+                        if _perfPartLTM[d] == nil then
+                            _perfPartLTM[d] = d.LocalTransparencyModifier
+                        end
+                        d.LocalTransparencyModifier = 1
+                    else
+                        local prev = _perfPartLTM[d]
+                        if prev ~= nil then
+                            d.LocalTransparencyModifier = prev
+                            _perfPartLTM[d] = nil
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function perfSweepEffectsHide()
+    for _, d in ipairs(workspace:GetDescendants()) do
+        if d:IsA("ParticleEmitter") or d:IsA("Trail") or d:IsA("Beam") then
+            if _perfEffOn[d] == nil then
+                _perfEffOn[d] = d.Enabled
+            end
+            d.Enabled = false
+        end
+    end
+end
+
+local function perfRestoreEffects()
+    for inst, was in pairs(_perfEffOn) do
+        pcall(function()
+            if inst and inst.Parent then inst.Enabled = was end
+        end)
+    end
+    for k in pairs(_perfEffOn) do _perfEffOn[k] = nil end
+end
+
+local function perfRestoreAllWeaponFolders()
+    perfSweepWeaponFolder(workspace:FindFirstChild(LP.Name), false)
+    for _, pl in ipairs(Players:GetPlayers()) do
+        if pl ~= LP then
+            perfSweepWeaponFolder(workspace:FindFirstChild(pl.Name), false)
+        end
+    end
+    perfCleanupStalePartKeys()
+end
+
+addThread(task.spawn(function()
+    while true do
+        if GEN ~= _G.MeleeRNG_Gen then break end
+        local ow = states.perfHideOtherWeapons
+        local sw = states.perfHideOwnWeapons
+        local ef = states.perfHideAllEffects
+        if not ow and not sw and not ef then
+            if _perfLastEffectsHidden then
+                perfRestoreEffects()
+                _perfLastEffectsHidden = false
+            end
+            perfRestoreAllWeaponFolders()
+            task.wait(0.5)
+            continue
+        end
+        task.wait(0.12)
+        if sw then
+            perfSweepWeaponFolder(workspace:FindFirstChild(LP.Name), true)
+        else
+            perfSweepWeaponFolder(workspace:FindFirstChild(LP.Name), false)
+        end
+        if ow then
+            for _, pl in ipairs(Players:GetPlayers()) do
+                if pl ~= LP then
+                    perfSweepWeaponFolder(workspace:FindFirstChild(pl.Name), true)
+                end
+            end
+        else
+            for _, pl in ipairs(Players:GetPlayers()) do
+                if pl ~= LP then
+                    perfSweepWeaponFolder(workspace:FindFirstChild(pl.Name), false)
+                end
+            end
+        end
+        perfCleanupStalePartKeys()
+        if ef then
+            _perfFxAcc = _perfFxAcc + 1
+            if _perfFxAcc >= 5 then
+                _perfFxAcc = 0
+                perfSweepEffectsHide()
+            end
+            _perfLastEffectsHidden = true
+        elseif _perfLastEffectsHidden then
+            _perfFxAcc = 0
+            perfRestoreEffects()
+            _perfLastEffectsHidden = false
+        end
+    end
+end))
+
 -- Equip/unequip: child count changes → dirty → next Heartbeat rebuildHitboxCache
 addThread(task.spawn(function()
     local lastCount = 0
@@ -2957,6 +3082,36 @@ MiscTab:Toggle("🙈 Show HideMobs Button", "Keeps HideMobsBtn visible — saved
             :WaitForChild("HideMobsBtn",3).Visible = on
     end)
     SLbl.Text = on and "✓ HideMobsBtn shown" or "HideMobsBtn hidden"
+end)
+
+MiscTab:Section("Performance")
+MiscTab:Label("Hide spinning weapons to reduce lag. Client-only (workspace weapon folders + VFX).")
+local perfOtherToggle = MiscTab:Toggle("Hide Other Players' Weapons", "LocalTransparencyModifier on models under workspace[their name] — saved", states.perfHideOtherWeapons, function(on)
+    states.perfHideOtherWeapons = on == true
+    saveSettings()
+    SLbl.Text = on and "Perf: others’ weapons hidden" or "Perf: others’ weapons shown"
+end)
+local perfOwnToggle = MiscTab:Toggle("Hide Own Weapons", "Same for workspace[" .. LP.Name .. "] (your equipped spins) — saved", states.perfHideOwnWeapons, function(on)
+    states.perfHideOwnWeapons = on == true
+    saveSettings()
+    SLbl.Text = on and "Perf: your weapons hidden" or "Perf: your weapons shown"
+end)
+local perfFxToggle = MiscTab:Toggle("Hide All Effects", "Disables ParticleEmitter, Trail, Beam under workspace (restores prior Enabled when off) — saved", states.perfHideAllEffects, function(on)
+    states.perfHideAllEffects = on == true
+    saveSettings()
+    if on == true then
+        pcall(perfSweepEffectsHide)
+        _perfLastEffectsHidden = true
+        _perfFxAcc = 0
+    end
+    SLbl.Text = on and "Perf: workspace VFX off" or "Perf: workspace VFX restored"
+end)
+task.defer(function()
+    pcall(function()
+        if perfOtherToggle and perfOtherToggle.Set then perfOtherToggle.Set(states.perfHideOtherWeapons) end
+        if perfOwnToggle and perfOwnToggle.Set then perfOwnToggle.Set(states.perfHideOwnWeapons) end
+        if perfFxToggle and perfFxToggle.Set then perfFxToggle.Set(states.perfHideAllEffects) end
+    end)
 end)
 
 MiscTab:Section("Upgrades (debug)")
