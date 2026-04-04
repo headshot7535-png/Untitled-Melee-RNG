@@ -122,6 +122,128 @@ local function invokeR(name, ...)
     return ok and res or nil
 end
 
+-- ── Guild (GuildUIController + SharedConstants.GuildConstants) ─────────
+local _guildBuffDefs = nil
+pcall(function()
+    local sc = RS:FindFirstChild("SharedConstants")
+    local m = sc and sc:FindFirstChild("GuildConstants")
+    if m and m:IsA("ModuleScript") then
+        local gc = require(m)
+        if type(gc) == "table" and type(gc.GuildBuffs) == "table" then
+            _guildBuffDefs = gc.GuildBuffs
+        end
+    end
+end)
+
+local GUILD_BUFF_ORDER = {
+    "Roll Speed", "Kill Multiplier", "Mana Multiplier", "Damage Multiplier", "Max Guild Members",
+}
+
+local GUILD_BUFF_COST_FALLBACK = {
+    ["Roll Speed"] = function(l) return 5 + l * 20 end,
+    ["Kill Multiplier"] = function(l) return 20 + l * 10 end,
+    ["Mana Multiplier"] = function(l) return 7 + l * 15 end,
+    ["Damage Multiplier"] = function(l) return 10 + l * 10 end,
+    ["Max Guild Members"] = function(l) return 10 + l * 20 end,
+}
+
+local function guildBuffNextCost(buffName, currentLevel)
+    local l = math.max(0, math.floor(tonumber(currentLevel) or 0))
+    local def = _guildBuffDefs and _guildBuffDefs[buffName]
+    if def and type(def.Cost) == "function" then
+        return def.Cost(l)
+    end
+    local f = GUILD_BUFF_COST_FALLBACK[buffName]
+    return f and f(l) or math.huge
+end
+
+local function invokeR2(name, ...)
+    local r = R(name)
+    if not r then return false, nil, nil end
+    local args = table.pack(...)
+    local pack = { pcall(function()
+        return r:InvokeServer(table.unpack(args, 1, args.n))
+    end) }
+    if not pack[1] then return false, nil, nil end
+    return true, pack[2], pack[3]
+end
+
+local function fetchGuildState()
+    local r = R("GetAssignedGuild")
+    if not r then return nil end
+    local ok, g = pcall(function() return r:InvokeServer(true) end)
+    if ok and type(g) == "table" and g.GuildID then return g end
+    ok, g = pcall(function() return r:InvokeServer() end)
+    if ok and type(g) == "table" and g.GuildID then return g end
+    return nil
+end
+
+local function guildPlayerIsMember(g)
+    if not g or type(g.Members) ~= "table" then return false end
+    local id = LP.UserId
+    return g.Members[tostring(id)] ~= nil or g.Members[id] ~= nil
+end
+
+-- ── Ascend AP statues (AscendUpgradesController + AscendUpgrades) ───────
+-- Dump: GetAscendUpgrades, GetAscendPoints, UpgradeAscend(upgradeName); max L10
+local _ascendApDefs = nil
+pcall(function()
+    local sc = RS:FindFirstChild("SharedConstants")
+    local m = sc and sc:FindFirstChild("AscendUpgrades")
+    if m and m:IsA("ModuleScript") then
+        local t = require(m)
+        if type(t) == "table" then _ascendApDefs = t end
+    end
+end)
+
+local ASCEND_AP_MAX_LEVEL = 10
+
+local ASCEND_AP_ORDER = {
+    "Boss Raid SP Multiplier",
+    "Faster Rolls",
+    "Zombie with weapon chance",
+    "Double weapon chance",
+    "Ascend points upgrade",
+    "Chance to keep upgrade when ascend",
+    "Totem Of Fortune Sacrifices",
+}
+
+local ASCEND_AP_COST_FALLBACK = {
+    ["Boss Raid SP Multiplier"] = function(nextL) return 2 * nextL end,
+    ["Faster Rolls"] = function(nextL) return 2 * nextL end,
+    ["Zombie with weapon chance"] = function(nextL) return 3 * nextL end,
+    ["Double weapon chance"] = function(nextL) return 3 * nextL end,
+    ["Ascend points upgrade"] = function(nextL) return 4 * nextL end,
+    ["Chance to keep upgrade when ascend"] = function(nextL) return 4 * nextL end,
+    ["Totem Of Fortune Sacrifices"] = function(nextL) return 2 * nextL end,
+}
+
+local function ascendApNextCost(name, currentLevel)
+    local lv = math.max(0, math.floor(tonumber(currentLevel) or 0))
+    if lv >= ASCEND_AP_MAX_LEVEL then return math.huge end
+    local nextL = lv + 1
+    local def = _ascendApDefs and _ascendApDefs[name]
+    if def and type(def.Cost) == "function" then
+        return def.Cost(nextL)
+    end
+    local f = ASCEND_AP_COST_FALLBACK[name]
+    return f and f(nextL) or math.huge
+end
+
+local function parseAscendPoints(raw)
+    if type(raw) == "number" and raw == raw then return math.floor(math.max(0, raw)) end
+    if type(raw) == "string" then
+        local stripped = raw:gsub("[^%d]", "")
+        if stripped ~= "" then
+            local n = tonumber(stripped)
+            if n then return math.floor(math.max(0, n)) end
+        end
+        local n2 = tonumber(raw)
+        return n2 and math.floor(math.max(0, n2)) or 0
+    end
+    return 0
+end
+
 -- ── Live mob table (mirrors MobsClientController u19) ─────────
 -- We read directly from workspace.Mobs. Each model has attribute "ID".
 -- Properties confirmed: Root=HumanoidRootPart, Health via HitMob event.
@@ -214,6 +336,12 @@ local states = {
     hitboxDutyCycle  = 2,  -- BIG on 1 frame per N heartbeats (2 = half the frames big, old behavior; 6+ = mostly tiny, less physics lag)
     autoUpgradeOn  = false,  -- master Auto Upgrade loop (saved with other toggles)
     autoManaToSP   = false,  -- Heartbeat: CalculateManaPrice + ConvertMana (1 unit, ~10/s cap)
+    -- Guild: BuyGP(SP) → GP; BuyGuildBuff(guildId, name) — dump GuildUIController
+    autoGuildSpToGp = false,  -- members: spend SP down to guildSpReserve
+    guildSpReserve  = 0,      -- min SP to keep when auto SP→GP
+    autoGuildBuffs  = false,  -- guild owner: buy cheapest affordable buff each tick
+    -- Ascend Points statues (castle): GetAscendUpgrades + UpgradeAscend — dump AscendUpgradesController
+    autoApUpgrades  = false,  -- buy cheapest affordable AP upgrade among toggled rows (L0–L10)
     -- After ascend: TP target (HumanoidRootPart + 3 studs Y); set via Misc → Ascend
     ascendAfterTpX = DEF_ASCEND_TP_X,
     ascendAfterTpY = DEF_ASCEND_TP_Y,
@@ -247,6 +375,14 @@ local UPGRADE_ORDER = {
 
 local upgradeSelected = {}  -- [upgradeName] = bool — filled from LS below
 local upgradeLevelCap = {} -- [upgradeName] = max level (stop auto-buy when current >= cap); nil = no cap
+local guildBuffSelected = {} -- [buffName] = bool — which guild buffs auto-buy may purchase
+for _, gn in ipairs(GUILD_BUFF_ORDER) do
+    guildBuffSelected[gn] = true
+end
+local apUpgradeSelected = {} -- [AscendUpgrades key] = bool
+for _, an in ipairs(ASCEND_AP_ORDER) do
+    apUpgradeSelected[an] = true
+end
 local _sacNameSelected = {} -- [weaponName] = bool — Sacrifice "By Name" picks (persisted)
 
 local walkSpeedVal   = 16
@@ -267,6 +403,16 @@ local function saveSettings()
             up[name] = upgradeSelected[name] == true
         end
         t.upgradeSelected = up
+        local gbs = {}
+        for _, gn in ipairs(GUILD_BUFF_ORDER) do
+            gbs[gn] = guildBuffSelected[gn] == true
+        end
+        t.guildBuffSelected = gbs
+        local aps = {}
+        for _, an in ipairs(ASCEND_AP_ORDER) do
+            aps[an] = apUpgradeSelected[an] == true
+        end
+        t.apUpgradeSelected = aps
         local ucaps = {}
         for _, un in ipairs(UPGRADE_ORDER) do
             local c = upgradeLevelCap[un]
@@ -319,6 +465,22 @@ if type(LS.upgradeSelected) == "table" then
         upgradeSelected[name] = (v == true or v == 1)
     end
 end
+if type(LS.guildBuffSelected) == "table" then
+    for _, gn in ipairs(GUILD_BUFF_ORDER) do
+        local v = LS.guildBuffSelected[gn]
+        if v ~= nil then
+            guildBuffSelected[gn] = (v == true or v == 1)
+        end
+    end
+end
+if type(LS.apUpgradeSelected) == "table" then
+    for _, an in ipairs(ASCEND_AP_ORDER) do
+        local v = LS.apUpgradeSelected[an]
+        if v ~= nil then
+            apUpgradeSelected[an] = (v == true or v == 1)
+        end
+    end
+end
 if type(LS.upgradeLevelCap) == "table" then
     for _, name in ipairs(UPGRADE_ORDER) do
         local v = tonumber(LS.upgradeLevelCap[name])
@@ -354,6 +516,10 @@ states.totemFilterColor = states.totemFilterColor == true
 states.totemRarityCapIdx = math.clamp(math.floor(tonumber(states.totemRarityCapIdx) or 1), 1, 9)
 states.totemKeepQty = math.clamp(math.floor(tonumber(states.totemKeepQty) or 0), 0, 999)
 states.totemDoneThisCycle = math.max(0, math.floor(tonumber(states.totemDoneThisCycle) or 0))
+states.autoGuildSpToGp = states.autoGuildSpToGp == true
+states.autoGuildBuffs = states.autoGuildBuffs == true
+states.autoApUpgrades = states.autoApUpgrades == true
+states.guildSpReserve = math.clamp(math.floor(tonumber(states.guildSpReserve) or 0), 0, 100000000)
 -- Totem CD/cap from LS applied in totem block (after TOTEM_CYCLE_SEC) + sanitize vs os.time()
 
 local function getAscendAfterTpCFrame()
@@ -495,6 +661,10 @@ local ESPTab  = Win:Tab("👁️",  "ESP")
 local AreaTab = Win:Tab("🗺️",  "Areas")
 local UpgTab  = Win:Tab("⬆️",  "Upgrades")
 local SacTab  = Win:Tab("🕯️", "Sacrifice")
+local GuildTab = Win:Tab("🏰", "Guild")
+local ApTab    = Win:Tab("🔱", "Ascend AP")
+local guildStatusLbl -- assigned with Guild UI; refreshed in Misc → Stats loop
+local apStatusLbl    -- assigned with Ascend AP UI; refreshed in Stats loop
 
 -- Auto upgrade: SP, GetUnlockedUpgrades / GetUpgradeLevel / BuyUpgrade (prices = SharedConstants client copy)
 
@@ -845,6 +1015,92 @@ addThread(task.spawn(function()
                 upgFormatAllToggled(candidates)))
         end
 
+    end
+end))
+
+-- ── Guild: SP → GP (BuyGP) + auto buffs (BuyGuildBuff) ────────────────────
+addThread(task.spawn(function()
+    while true do
+        if GEN ~= _G.MeleeRNG_Gen then break end
+        task.wait(0.55)
+        if not states.autoGuildSpToGp then continue end
+        if not R("BuyGP") then continue end
+        local g = fetchGuildState()
+        if not g or not guildPlayerIsMember(g) then continue end
+        local sp = tonumber(getSP()) or 0
+        local reserve = math.max(0, math.floor(tonumber(states.guildSpReserve) or 0))
+        local spend = math.floor(sp - reserve)
+        if spend <= 0 then continue end
+        invokeR("BuyGP", spend)
+        _cachedStats["SP"] = nil
+    end
+end))
+
+addThread(task.spawn(function()
+    while true do
+        if GEN ~= _G.MeleeRNG_Gen then break end
+        task.wait(1.15)
+        if not states.autoGuildBuffs then continue end
+        if not R("BuyGuildBuff") then continue end
+        local g = fetchGuildState()
+        if not g or not g.GuildID then continue end
+        if tostring(g.Owner) ~= tostring(LP.UserId) then continue end
+
+        local buffs = type(g.GuildBuffs) == "table" and g.GuildBuffs or {}
+        local gp = tonumber(g.GuildPoints) or 0
+        local rows = {}
+        for _, name in ipairs(GUILD_BUFF_ORDER) do
+            if guildBuffSelected[name] ~= true then continue end
+            local lvl = tonumber(buffs[name]) or 0
+            local cost = guildBuffNextCost(name, lvl)
+            if type(cost) == "number" and cost == cost and cost > 0 and cost < math.huge then
+                rows[#rows + 1] = { name = name, cost = cost, lvl = lvl }
+            end
+        end
+        table.sort(rows, function(a, b) return a.cost < b.cost end)
+
+        for _, row in ipairs(rows) do
+            if gp < row.cost then continue end
+            local ok, newLevel, newGP = invokeR2("BuyGuildBuff", g.GuildID, row.name)
+            if ok and type(newLevel) == "number" then
+                gp = tonumber(newGP) or (gp - row.cost)
+                break
+            end
+        end
+    end
+end))
+
+-- ── Ascend AP statue upgrades (UpgradeAscend) ─────────────────────────────
+addThread(task.spawn(function()
+    while true do
+        if GEN ~= _G.MeleeRNG_Gen then break end
+        task.wait(1.2)
+        if not states.autoApUpgrades then continue end
+        if not R("UpgradeAscend") or not R("GetAscendUpgrades") then continue end
+
+        local levels = invokeR("GetAscendUpgrades")
+        if type(levels) ~= "table" then continue end
+
+        local ap = parseAscendPoints(invokeR("GetAscendPoints"))
+        local rows = {}
+        for _, name in ipairs(ASCEND_AP_ORDER) do
+            if apUpgradeSelected[name] ~= true then continue end
+            local lvl = tonumber(levels[name]) or 0
+            if lvl >= ASCEND_AP_MAX_LEVEL then continue end
+            local cost = ascendApNextCost(name, lvl)
+            if type(cost) == "number" and cost == cost and cost > 0 and cost < math.huge then
+                rows[#rows + 1] = { name = name, cost = cost, lvl = lvl }
+            end
+        end
+        table.sort(rows, function(a, b) return a.cost < b.cost end)
+
+        for _, row in ipairs(rows) do
+            if ap < row.cost then continue end
+            local ok, newLevel = invokeR2("UpgradeAscend", row.name)
+            if ok and type(newLevel) == "number" then
+                break
+            end
+        end
     end
 end))
 
@@ -2558,6 +2814,23 @@ addThread(task.spawn(function()
         pcall(function()
             StatsLbl.Set(string.format("Kills: %s | Mana: %s | SP: %s | Ascends: %s",
                 tostring(getKills()), tostring(getMana()), tostring(getSP()), tostring(getAscends())))
+            if guildStatusLbl and guildStatusLbl.Set then
+                local g = fetchGuildState()
+                if g then
+                    local own = tostring(g.Owner) == tostring(LP.UserId)
+                    guildStatusLbl.Set(string.format(
+                        "Guild: %s | GP: %s | %s",
+                        tostring(g.Name or "?"),
+                        tostring(g.GuildPoints or 0),
+                        own and "owner" or "member"))
+                else
+                    guildStatusLbl.Set("Guild: — (join/create in game)")
+                end
+            end
+            if apStatusLbl and apStatusLbl.Set then
+                local ap = parseAscendPoints(invokeR("GetAscendPoints"))
+                apStatusLbl.Set(string.format("Ascend Points: %s (castle statue upgrades)", tostring(ap)))
+            end
             local dest, killsNeeded, req = getAscendETA()
             if req then
                 local etaSecs = (kpm>0 and killsNeeded>0) and (killsNeeded/kpm*60) or nil
@@ -2717,6 +2990,142 @@ task.defer(function()
     end)
 end)
 
+GuildTab:Section("Status")
+guildStatusLbl = GuildTab:Label("Guild: — (join/create in game)")
+GuildTab:Label("Remotes: BuyGP(spAmount) · BuyGuildBuff(guildId, buff). Buffs match GuildConstants.")
+
+GuildTab:Section("SP → GP")
+local guildSpToGpToggle = GuildTab:Toggle("💠 Auto SP → GP", "In a guild as member: calls BuyGP with (SP − reserve) ~2/s. Same as Add GP page SP box — saved.", states.autoGuildSpToGp, function(on)
+    states.autoGuildSpToGp = on == true
+    saveSettings()
+    SLbl.Text = on and "Guild: Auto SP→GP ON" or "Guild: Auto SP→GP OFF"
+end)
+GuildTab:Slider("Reserve SP", "Never spend below this much SP when Auto SP→GP runs (saved)", {
+    min = 0, max = 100000000, default = math.clamp(states.guildSpReserve, 0, 100000000),
+    format = function(v) return string.format("keep %s SP", tostring(math.floor(v))) end,
+}, function(v)
+    states.guildSpReserve = math.clamp(math.floor(v), 0, 100000000)
+    saveSettings()
+end)
+GuildTab:Button("➕", "SP → GP once", "BuyGP(current SP minus reserve) one shot", C.accent, function()
+    if not R("BuyGP") then SLbl.Text = "⚠ BuyGP remote missing"; return end
+    local g = fetchGuildState()
+    if not g or not guildPlayerIsMember(g) then SLbl.Text = "⚠ Not in a guild"; return end
+    local sp = tonumber(getSP()) or 0
+    local reserve = math.max(0, math.floor(tonumber(states.guildSpReserve) or 0))
+    local spend = math.floor(sp - reserve)
+    if spend <= 0 then SLbl.Text = "⚠ No SP to spend (check reserve)"; return end
+    invokeR("BuyGP", spend)
+    _cachedStats["SP"] = nil
+    SLbl.Text = "✓ BuyGP(" .. tostring(spend) .. " SP)"
+end)
+
+GuildTab:Section("Buff upgrades")
+local guildBuffAutoToggle = GuildTab:Toggle("⚔️ Auto guild buff upgrades", "Guild owner only. Each tick buys the cheapest affordable buff among the toggles below — saved.", states.autoGuildBuffs, function(on)
+    states.autoGuildBuffs = on == true
+    saveSettings()
+    SLbl.Text = on and "Guild: Auto buffs ON" or "Guild: Auto buffs OFF"
+end)
+GuildTab:Label("Buff targets (ON = included; auto picks cheapest):")
+local guildBuffToggles = {}
+for _, gn in ipairs(GUILD_BUFF_ORDER) do
+    guildBuffToggles[gn] = GuildTab:Toggle(gn, "Allow auto guild upgrade to buy this buff — saved", guildBuffSelected[gn] == true, function(on)
+        guildBuffSelected[gn] = (on == true)
+        saveSettings()
+    end)
+end
+GuildTab:Button("✅", "Buffs: all / none", "Flip every guild buff target on or off at once — saved", C.green, function()
+    local anyOff = false
+    for _, n in ipairs(GUILD_BUFF_ORDER) do
+        if not guildBuffSelected[n] then anyOff = true; break end
+    end
+    local turnOn = anyOff
+    for _, n in ipairs(GUILD_BUFF_ORDER) do
+        guildBuffSelected[n] = turnOn
+        local tr = guildBuffToggles[n]
+        if tr and tr.Set then pcall(function() tr.Set(turnOn) end) end
+    end
+    saveSettings()
+    SLbl.Text = turnOn and "Guild buffs: all ON" or "Guild buffs: all OFF"
+end)
+
+task.defer(function()
+    pcall(function()
+        if guildSpToGpToggle and guildSpToGpToggle.Set then guildSpToGpToggle.Set(states.autoGuildSpToGp) end
+        if guildBuffAutoToggle and guildBuffAutoToggle.Set then guildBuffAutoToggle.Set(states.autoGuildBuffs) end
+        for _, gn in ipairs(GUILD_BUFF_ORDER) do
+            local tr = guildBuffToggles[gn]
+            if tr and tr.Set then tr.Set(guildBuffSelected[gn] == true) end
+        end
+    end)
+end)
+
+ApTab:Section("Ascend Points upgrades")
+apStatusLbl = ApTab:Label("Ascend Points: —")
+ApTab:Label("SharedConstants.AscendUpgrades · Remotes: GetAscendPoints, GetAscendUpgrades, UpgradeAscend(name). Max L10.")
+local apAutoToggle = ApTab:Toggle("⚡ Auto AP upgrades", "Buys the cheapest affordable upgrade among toggled rows (~1.2s). Saved.", states.autoApUpgrades, function(on)
+    states.autoApUpgrades = on == true
+    saveSettings()
+    SLbl.Text = on and "Ascend AP: auto ON" or "Ascend AP: auto OFF"
+end)
+ApTab:Label("Include in auto (cheapest among ON):")
+local apUpgradeToggles = {}
+for _, an in ipairs(ASCEND_AP_ORDER) do
+    apUpgradeToggles[an] = ApTab:Toggle(an, "Allow auto to purchase this AP statue upgrade — saved", apUpgradeSelected[an] == true, function(on)
+        apUpgradeSelected[an] = (on == true)
+        saveSettings()
+    end)
+end
+ApTab:Button("✅", "AP upgrades: all / none", "Flip every AP upgrade toggle — saved", C.green, function()
+    local anyOff = false
+    for _, n in ipairs(ASCEND_AP_ORDER) do
+        if not apUpgradeSelected[n] then anyOff = true; break end
+    end
+    local turnOn = anyOff
+    for _, n in ipairs(ASCEND_AP_ORDER) do
+        apUpgradeSelected[n] = turnOn
+        local tr = apUpgradeToggles[n]
+        if tr and tr.Set then pcall(function() tr.Set(turnOn) end) end
+    end
+    saveSettings()
+    SLbl.Text = turnOn and "AP upgrades: all ON" or "AP upgrades: all OFF"
+end)
+ApTab:Button("⬆️", "Upgrade once (cheapest)", "Single UpgradeAscend for cheapest affordable row that is toggled ON", C.accent, function()
+    if not R("UpgradeAscend") then SLbl.Text = "⚠ UpgradeAscend missing"; return end
+    local levels = invokeR("GetAscendUpgrades")
+    if type(levels) ~= "table" then SLbl.Text = "⚠ GetAscendUpgrades failed"; return end
+    local ap = parseAscendPoints(invokeR("GetAscendPoints"))
+    local rows = {}
+    for _, name in ipairs(ASCEND_AP_ORDER) do
+        if apUpgradeSelected[name] ~= true then continue end
+        local lvl = tonumber(levels[name]) or 0
+        if lvl >= ASCEND_AP_MAX_LEVEL then continue end
+        local cost = ascendApNextCost(name, lvl)
+        if type(cost) == "number" and cost == cost and cost > 0 and cost < math.huge then
+            rows[#rows + 1] = { name = name, cost = cost }
+        end
+    end
+    table.sort(rows, function(a, b) return a.cost < b.cost end)
+    for _, row in ipairs(rows) do
+        if ap < row.cost then SLbl.Text = string.format("⚠ Need %d AP for %s", row.cost, row.name); return end
+        local ok, newLevel = invokeR2("UpgradeAscend", row.name)
+        if ok and type(newLevel) == "number" then
+            SLbl.Text = "✓ " .. row.name .. " → L" .. tostring(newLevel)
+            return
+        end
+    end
+    SLbl.Text = "⚠ No upgrade bought (maxed or server rejected)"
+end)
+task.defer(function()
+    pcall(function()
+        if apAutoToggle and apAutoToggle.Set then apAutoToggle.Set(states.autoApUpgrades) end
+        for _, an in ipairs(ASCEND_AP_ORDER) do
+            local tr = apUpgradeToggles[an]
+            if tr and tr.Set then tr.Set(apUpgradeSelected[an] == true) end
+        end
+    end)
+end)
+
 MiscTab:Section("Community")
 MiscTab:Button("💬", "Join Discord", "Opens discord.gg/vSTmMTyw in browser", C.purple, function()
     if setclipboard then
@@ -2751,6 +3160,9 @@ MiscTab:Button("🛑", "Stop All Loops", "Disconnects all connections and cancel
     states.autoSacrifice = false
     states.autoTotem   = false
     states.autoManaToSP  = false
+    states.autoGuildSpToGp = false
+    states.autoGuildBuffs = false
+    states.autoApUpgrades = false
     pcall(function()
         if sacAutoToggle and sacAutoToggle.Set then sacAutoToggle.Set(false) end
     end)
@@ -2759,6 +3171,15 @@ MiscTab:Button("🛑", "Stop All Loops", "Disconnects all connections and cancel
     end)
     pcall(function()
         if manaToSpToggle and manaToSpToggle.Set then manaToSpToggle.Set(false) end
+    end)
+    pcall(function()
+        if guildSpToGpToggle and guildSpToGpToggle.Set then guildSpToGpToggle.Set(false) end
+    end)
+    pcall(function()
+        if guildBuffAutoToggle and guildBuffAutoToggle.Set then guildBuffAutoToggle.Set(false) end
+    end)
+    pcall(function()
+        if apAutoToggle and apAutoToggle.Set then apAutoToggle.Set(false) end
     end)
     states.noclip    = false; states.godMode   = false
     states.fly       = false; states.antiAfk   = false
