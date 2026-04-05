@@ -524,6 +524,7 @@ states.autoAscend    = states.autoAscend == true
 states.autoCycleFarm = states.autoCycleFarm == true
 states.autoSacrifice = states.autoSacrifice == true
 states.autoManaToSP  = states.autoManaToSP == true
+states.autoEquipBest = states.autoEquipBest == true
 if LS.sacFilterColor ~= nil then
     states.sacFilterColor = LS.sacFilterColor == true
 elseif LS.sacFilterRarity ~= nil then
@@ -3105,6 +3106,18 @@ end)
 MoveTab:Toggle("💡 Full Bright", "Max ambient light, remove fog", states.fullBright, function(on)
     states.fullBright = on; saveSettings()
 end)
+local autoEquipBestToggle = MoveTab:Toggle("⚔️ Auto Equip Best", "Remotes.EquipBest:FireServer() every 10s while ON — same as the in-game Equip Best button (Weapons UI)", states.autoEquipBest, function(on)
+    states.autoEquipBest = on == true
+    saveSettings()
+    SLbl.Text = on and "Auto Equip Best ON (every 10s)" or "Auto Equip Best OFF"
+end)
+task.defer(function()
+    pcall(function()
+        if autoEquipBestToggle and autoEquipBestToggle.Set then
+            autoEquipBestToggle.Set(states.autoEquipBest)
+        end
+    end)
+end)
 
 MoveTab:Section("Actions")
 MoveTab:Button("📋", "Print Position", "Prints XYZ + current area to output", C.accent, function()
@@ -3272,6 +3285,18 @@ end)
 -- ============================================================
 --  FEATURE LOGIC LOOPS
 -- ============================================================
+
+-- ── Auto Equip Best (WeaponsUI EquipBestBtn → Remotes.EquipBest:FireServer) ──
+addThread(task.spawn(function()
+    while true do
+        if GEN ~= _G.MeleeRNG_Gen then break end
+        task.wait(10)
+        if not states.autoEquipBest then continue end
+        pcall(function()
+            fireR("EquipBest")
+        end)
+    end
+end))
 
 -- ── Infinite Jump ─────────────────────────────────────────────
 addConn(UserInputService.JumpRequest:Connect(function()
@@ -4253,6 +4278,7 @@ MiscTab:Button("🛑", "Stop All Loops", "Disconnects all connections and cancel
     states.autoGuildSpToGp = false
     states.autoGuildBuffs = false
     states.autoApUpgrades = false
+    states.autoEquipBest = false
     pcall(function()
         if sacAutoToggle and sacAutoToggle.Set then sacAutoToggle.Set(false) end
     end)
@@ -4276,6 +4302,9 @@ MiscTab:Button("🛑", "Stop All Loops", "Disconnects all connections and cancel
     end)
     pcall(function()
         if autoAscendToggle and autoAscendToggle.Set then autoAscendToggle.Set(false) end
+    end)
+    pcall(function()
+        if autoEquipBestToggle and autoEquipBestToggle.Set then autoEquipBestToggle.Set(false) end
     end)
     states.noclip    = false; states.godMode   = false
     states.fly       = false; states.antiAfk   = false
