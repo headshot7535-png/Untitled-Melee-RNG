@@ -324,6 +324,8 @@ end
 local states = {
     autoEquipBest  = false,
     autoAscend     = false,
+    -- Full loop: saved Ascend TP → SetSetting AutoRaid + force auto upgrades → caps → raid OFF → farm kills → ascend → repeat (turn OFF Auto Ascend while ON)
+    autoCycleFarm  = false,
     farmBoss       = true,   -- ON by default: higher areas spawn bosses
     farmMegaBoss   = false,
     skipRegular    = false,
@@ -386,6 +388,9 @@ local states = {
     perfLowGraphicsQuality = false, -- UserGameSettings quality (executor/client dependent)
     perfHideOtherCharacters = false, -- other players’ Character rigs invisible locally (intrusive)
 }
+
+-- Auto Farm cycle: live status line for Misc label (not in states — avoids persisting to settings JSON)
+local meleeAutoFarmStatus = { line = "🔁 Farm cycle: OFF" }
 
 -- Upgrade names for save/load (must exist before saveSettings references upgradeSelected)
 local UPGRADE_ORDER = {
@@ -516,6 +521,7 @@ if type(LS.sacNamesSelected) == "table" then
 end
 states.autoUpgradeOn = states.autoUpgradeOn == true
 states.autoAscend    = states.autoAscend == true
+states.autoCycleFarm = states.autoCycleFarm == true
 states.autoSacrifice = states.autoSacrifice == true
 states.autoManaToSP  = states.autoManaToSP == true
 if LS.sacFilterColor ~= nil then
@@ -619,6 +625,60 @@ local function fireGuiButtonClick(btn)
     return false
 end
 
+local function meleeResolveAutoRaidBtn()
+    local pg = LP:FindFirstChild("PlayerGui")
+    if not pg then return nil end
+    local main = pg:FindFirstChild("MainGUI")
+    if not main then return nil end
+    local ol = main:FindFirstChild("OptionsList")
+    if not ol then return nil end
+    return ol:FindFirstChild("AutoRaidBtn")
+end
+
+--- nil if label missing / unrecognized; true/false from "AUTO RAID: ON|OFF"
+local function meleeAutoRaidBtnLabelIsOn(btn)
+    if not btn then return nil end
+    local tl = btn:FindFirstChild("TextLabel")
+    local t = tl and tl.Text
+    if type(t) ~= "string" then return nil end
+    if string.find(t, ": ON", 1, true) then return true end
+    if string.find(t, ": OFF", 1, true) then return false end
+    return nil
+end
+
+--- Client script syncs Auto Raid only on button click; FireServer alone can leave UI + u205 stale.
+local function meleeSetGameAutoRaidEnabled(wantOn)
+    wantOn = wantOn == true
+    local btn = meleeResolveAutoRaidBtn()
+    if btn then
+        pcall(function()
+            btn.Visible = true
+        end)
+        local cur = meleeAutoRaidBtnLabelIsOn(btn)
+        if cur == false and wantOn or cur == true and not wantOn then
+            fireGuiButtonClick(btn)
+            task.wait(0.12)
+        elseif cur == nil and wantOn then
+            fireGuiButtonClick(btn)
+            task.wait(0.12)
+        end
+    end
+    local rs = R("SetSetting")
+    if rs then
+        pcall(function()
+            rs:FireServer("AutoRaidEnabled", wantOn)
+        end)
+    end
+    return btn ~= nil or rs ~= nil
+end
+
+local function meleeAutoRaidUiShort()
+    local cur = meleeAutoRaidBtnLabelIsOn(meleeResolveAutoRaidBtn())
+    if cur == true then return "ON" end
+    if cur == false then return "OFF" end
+    return "?"
+end
+
 local function manualAuraRollUiClose(main, roll)
     local general = main and main:FindFirstChild("GeneralUI")
     pcall(function()
@@ -686,6 +746,9 @@ local function waitAscendAuraKeepIfNeeded()
         task.wait(AURA_KEEP_POLL_SEC)
     end
 end
+
+-- Forward declaration: teleportAfterAscendIfConfirmed spawns a thread that calls this; assign body below after helpers exist.
+local maintainPreferredAuraSelection
 
 --- Wait for Ascends to increase, then keep TPing until local HRP reaches saved position once (or chase timeout).
 local function teleportAfterAscendIfConfirmed(beforeAscends)
@@ -780,7 +843,7 @@ local _auraMaintainLastFire = 0
 local AURA_MAINTAIN_COOLDOWN = 2.5
 
 -- Only FireServer SelectAura when Character.SelectedAura ≠ preferred (no redundant re-equip).
-local function maintainPreferredAuraSelection(forceNow)
+maintainPreferredAuraSelection = function(forceNow)
     if not states.auraMaintainSelection then return end
     local want = states.auraPreferredName
     if type(want) ~= "string" or want == "" then return end
@@ -805,6 +868,56 @@ local function forceSelectPreferredAuraNow()
     _auraMaintainLastFire = os.clock()
     fireR("SelectAura", name)
     return "fired"
+end
+
+-- Misc → Aura block in its own function (Luau ~200 local register limit in the main UI IIFE).
+local function meleeGuiMountMiscAuraSection(MiscTab, SLbl, C)
+    MiscTab:Section("Aura (SelectedAura + remotes)")
+    MiscTab:Label("Equipped aura = Character:GetAttribute(\"SelectedAura\"). Unlock list = GetUnlockedAuras; equip = SelectAura(name).")
+    local auraPreferredDropdown = MiscTab:Dropdown(
+        "Preferred aura",
+        "Choose one unlocked aura to equip. Tap Refresh if you just unlocked a new one — saved to settings.",
+        buildAuraDropdownOptions({}),
+        1,
+        function(_, val)
+            states.auraPreferredName = (type(val) == "string" and val) or ""
+            saveSettings()
+        end
+    )
+    local auraMaintainToggle = MiscTab:Toggle(
+        "Keep selected aura on",
+        "Every ~4s (and after respawn / post-ascend keep): if equipped ≠ preferred, fires SelectAura(preferred).",
+        states.auraMaintainSelection,
+        function(on)
+            states.auraMaintainSelection = on == true
+            saveSettings()
+            SLbl.Text = on and "Aura: maintain ON" or "Aura: maintain OFF"
+        end
+    )
+    MiscTab:Button("↻", "Refresh aura list", "GetUnlockedAuras → repopulates dropdown", C.sub, function()
+        local names = fetchUnlockedAuraNamesSorted()
+        auraPreferredDropdown.Refresh(buildAuraDropdownOptions(names), states.auraPreferredName)
+        SLbl.Text = (#names > 0) and ("✓ Aura list: " .. tostring(#names)) or "⚠ GetUnlockedAuras failed or empty"
+    end)
+    MiscTab:Button("✓", "Equip preferred now", "SelectAura only if equipped ≠ preferred and aura is unlocked", C.accent, function()
+        local r = forceSelectPreferredAuraNow()
+        if r == "fired" then
+            SLbl.Text = "✓ SelectAura → " .. tostring(states.auraPreferredName)
+        elseif r == "already" then
+            SLbl.Text = "✓ Aura already equipped: " .. tostring(states.auraPreferredName)
+        else
+            SLbl.Text = "⚠ Equip failed — set preferred, Refresh list, ensure unlocked"
+        end
+    end)
+    task.defer(function()
+        pcall(function()
+            local names = fetchUnlockedAuraNamesSorted()
+            auraPreferredDropdown.Refresh(buildAuraDropdownOptions(names), states.auraPreferredName)
+            if auraMaintainToggle and auraMaintainToggle.Set then
+                auraMaintainToggle.Set(states.auraMaintainSelection)
+            end
+        end)
+    end)
 end
 
 -- Guild / AP tab UI in separate functions (Luau: `do` does not reduce locals; only nested functions do).
@@ -3448,7 +3561,7 @@ end))
 addThread(task.spawn(function()
     while true do
         if GEN ~= _G.MeleeRNG_Gen then break end
-        if not states.autoAscend then task.wait(2); continue end
+        if not states.autoAscend or states.autoCycleFarm then task.wait(2); continue end
         pcall(function()
             local need = getAscendKillsRequired()
             if (tonumber(getKills()) or 0) < need then return end
@@ -3463,6 +3576,162 @@ addThread(task.spawn(function()
             end
         end)
         task.wait(5)
+    end
+end))
+
+-- ── Auto cycle: Ascend TP → Auto Raid + upgrades (caps) → farm → ascend (MobsClientController SetSetting / GetSetting) ──
+addThread(task.spawn(function()
+    local RAID_POLL_SEC = 1.25
+    local RAID_MAX_SEC = 2700
+    local FARM_POLL_SEC = 1.5
+    local function tpAscendSaved()
+        local root = getRoot()
+        if not root then return false end
+        return select(1, pcall(function()
+            root.CFrame = getAscendAfterTpCFrame() * CFrame.new(0, 3, 0)
+        end))
+    end
+    local function setGameAutoRaid(on)
+        return meleeSetGameAutoRaidEnabled(on == true)
+    end
+    local function raidSpendPhaseDone()
+        local anyCap = false
+        for _, name in ipairs(UPGRADE_ORDER) do
+            if upgradeSelected[name] then
+                local capN = upgradeLevelCap[name]
+                if type(capN) == "number" and capN >= 1 then
+                    anyCap = true
+                    if upgReadUpgradeLevel(name) < capN then return false end
+                end
+            end
+        end
+        if anyCap then return true end
+        return #upgBuildSortedCandidates() == 0
+    end
+    --- Count upgrade rows that are ON + have a cap; `need` = how many are still below that cap.
+    local function raidCappedUpgradesPending()
+        local need, tracked = 0, 0
+        for _, name in ipairs(UPGRADE_ORDER) do
+            if upgradeSelected[name] then
+                local capN = upgradeLevelCap[name]
+                if type(capN) == "number" and capN >= 1 then
+                    tracked = tracked + 1
+                    if upgReadUpgradeLevel(name) < capN then
+                        need = need + 1
+                    end
+                end
+            end
+        end
+        return need, tracked
+    end
+    local function raidCappedStatusFragment()
+        local need, tracked = raidCappedUpgradesPending()
+        if tracked == 0 then
+            return "caps — (no ON+cap on Upgrades tab)"
+        end
+        return string.format("%d/%d below cap", need, tracked)
+    end
+    while true do
+        if GEN ~= _G.MeleeRNG_Gen then break end
+        if not states.autoCycleFarm then
+            task.wait(2)
+            continue
+        end
+        pcall(function()
+            meleeAutoFarmStatus.line = "🔁 TP → saved Ascend spot"
+            SLbl.Text = "🔄 Cycle: TP → saved Ascend spot"
+            tpAscendSaved()
+            task.wait(0.65)
+            if not states.autoCycleFarm or GEN ~= _G.MeleeRNG_Gen then return end
+
+            local prevAU = states.autoUpgradeOn
+            states.autoUpgradeOn = true
+            if not setGameAutoRaid(true) then
+                meleeAutoFarmStatus.line = "⚠ No Auto Raid control (SetSetting / AutoRaidBtn) — use game UI"
+                SLbl.Text = "⚠ Cycle: SetSetting missing — enable Auto Raid in game UI"
+                task.wait(6)
+                return
+            end
+
+            meleeAutoFarmStatus.line = string.format(
+                "🔁 Raid + auto upgrade | Auto Raid: %s | %s | until caps / empty queue",
+                meleeAutoRaidUiShort(),
+                raidCappedStatusFragment())
+            SLbl.Text = "🔄 Cycle: Auto Raid ON + Auto Upgrade (until caps / empty queue)"
+            local tRaid = os.clock()
+            while states.autoCycleFarm and GEN == _G.MeleeRNG_Gen and os.clock() - tRaid < RAID_MAX_SEC do
+                local elapsed = os.clock() - tRaid
+                local done = raidSpendPhaseDone()
+                meleeAutoFarmStatus.line = string.format(
+                    "🔁 Raid + upgrade | Auto Raid UI: %s | %dm %02ds | %s | %s",
+                    meleeAutoRaidUiShort(),
+                    math.floor(elapsed / 60),
+                    math.floor(elapsed % 60),
+                    raidCappedStatusFragment(),
+                    done and "caps/queue done → next" or "buying…")
+                if done then break end
+                task.wait(RAID_POLL_SEC)
+            end
+
+            setGameAutoRaid(false)
+            states.autoUpgradeOn = prevAU
+
+            if not states.autoCycleFarm or GEN ~= _G.MeleeRNG_Gen then return end
+            if os.clock() - tRaid >= RAID_MAX_SEC then
+                meleeAutoFarmStatus.line = "⚠ Raid phase timeout — check SP / upgrade caps"
+                SLbl.Text = "⚠ Cycle: raid phase timeout — check caps / SP"
+            end
+
+            meleeAutoFarmStatus.line = string.format("🔁 Farm kills (raid OFF) | Auto Raid UI: %s", meleeAutoRaidUiShort())
+            SLbl.Text = "🔄 Cycle: farm kills at saved spot"
+            tpAscendSaved()
+            task.wait(0.5)
+            while states.autoCycleFarm and GEN == _G.MeleeRNG_Gen do
+                local k = tonumber(getKills()) or 0
+                local req = getAscendKillsRequired()
+                local dest, killsNeeded = getAscendETA()
+                local kpm = getKillRate()
+                meleeAutoFarmStatus.line = string.format(
+                    "🔁 Farm | %s / %s kills (%s left) → %s | ~%.1f KPM",
+                    tostring(k),
+                    tostring(req),
+                    tostring(killsNeeded),
+                    dest and tostring(dest) or "?",
+                    kpm)
+                if k >= req then break end
+                task.wait(FARM_POLL_SEC)
+            end
+
+            if not states.autoCycleFarm or GEN ~= _G.MeleeRNG_Gen then return end
+
+            meleeAutoFarmStatus.line = "🔁 Ascend — ConfirmAscend"
+            local area = invokeR("GetArea")
+            local np = area and area:FindFirstChild("NextPortal")
+            if not np then
+                meleeAutoFarmStatus.line = "⚠ No NextPortal — unlock area / stand at portal"
+                SLbl.Text = "⚠ Cycle: no NextPortal — stand in unlocked area"
+                task.wait(6)
+                return
+            end
+            local dest = np:GetAttribute("Destination")
+            local beforeA = tonumber(getAscends()) or 0
+            local ok = invokeR("ConfirmAscend")
+            if not ok then
+                meleeAutoFarmStatus.line = "⚠ ConfirmAscend failed — kills or requirement"
+                SLbl.Text = "⚠ Cycle: ConfirmAscend failed (kills / requirement)"
+                task.wait(8)
+                return
+            end
+            if teleportAfterAscendIfConfirmed(beforeA) then
+                meleeAutoFarmStatus.line = "🔁 Ascended → " .. tostring(dest or "?") .. " — looping"
+                SLbl.Text = "🔄 Cycle: ascended → " .. tostring(dest or "?") .. " — loop"
+            else
+                meleeAutoFarmStatus.line = "⚠ Ascend unclear — check Ascends stat"
+                SLbl.Text = "⚠ Cycle: ascend unclear — check Ascends stat"
+                task.wait(5)
+            end
+        end)
+        task.wait(2)
     end
 end))
 
@@ -3554,6 +3823,7 @@ local StatsLbl = MiscTab:Label("Kills: — | Mana: — | SP: — | Ascends: —"
 local KPMLbl   = MiscTab:Label("KPM: — | ETA ascend: —")
 local ETALbl   = MiscTab:Label("Ascend: — / — kills —")
 local AuraStatLbl = MiscTab:Label("Aura: equipped — | roll UI —")
+local autoFarmCycleStatusLbl
 
 addThread(task.spawn(function()
     while true do
@@ -3599,21 +3869,62 @@ addThread(task.spawn(function()
                 eqA or "—",
                 rollA or "—",
                 (states.auraPreferredName ~= "" and states.auraPreferredName) or "—"))
+            if autoFarmCycleStatusLbl and autoFarmCycleStatusLbl.Set then
+                if states.autoCycleFarm then
+                    autoFarmCycleStatusLbl.Set(meleeAutoFarmStatus.line)
+                else
+                    autoFarmCycleStatusLbl.Set("🔁 Farm cycle: OFF")
+                end
+            end
         end)
     end
 end))
 
 MiscTab:Section("Ascend")
+autoFarmCycleStatusLbl = MiscTab:Label("🔁 Farm cycle: OFF")
 local autoAscendToggle = MiscTab:Toggle("⬆️ Auto Ascend", "When kills ≥ (2 + your Ascends) × 1M — saved to meleernq_settings.json", states.autoAscend, function(on)
     states.autoAscend = on == true
     saveSettings()
     SLbl.Text = states.autoAscend and "Auto Ascend ON" or "Auto Ascend OFF"
 end)
+MiscTab:Label(
+    "Notes — Auto Ascend: watches kills and calls ConfirmAscend when you meet the formula above. It does not teleport to your saved spot, toggle Auto Raid, or run upgrades. Turn OFF when Auto Farm cycle is ON so only one system presses ascend.")
+local autoCycleFarmToggle = MiscTab:Toggle(
+    "🔁 Auto Farm cycle",
+    "Full loop: saved TP → Auto Raid + forced upgrades → raid off → farm kills → ascend → repeat. See notes below.",
+    states.autoCycleFarm,
+    function(on)
+        states.autoCycleFarm = on == true
+        saveSettings()
+        SLbl.Text = on and "Auto Farm cycle ON" or "Auto Farm cycle OFF"
+        meleeAutoFarmStatus.line = on and "🔁 Farm cycle: ON (waiting tick…)" or "🔁 Farm cycle: OFF"
+        pcall(function()
+            if autoFarmCycleStatusLbl and autoFarmCycleStatusLbl.Set then
+                autoFarmCycleStatusLbl.Set(meleeAutoFarmStatus.line)
+            end
+        end)
+    end
+)
+
+MiscTab:Label("Notes — Auto Farm cycle (read before enabling)")
+MiscTab:Label(
+    "Order: (1) Teleport to your saved Ascend TP (Misc → Set Ascend TP Here). (2) Turn the game Auto Raid ON: script fires the green AutoRaidBtn + SetSetting so the client matches (needs firesignal or getconnections). (3) Auto Upgrade is forced ON until every toggled upgrade that has a level cap reaches that cap, or there are no affordable buys left.")
+MiscTab:Label(
+    "Raid status “X/Y below cap”: X = upgrades still under their cap, Y = how many rows count — only rows that are toggled ON on the Upgrades tab and have a numeric cap set. Toggle OFF or leave cap empty = not counted. If Y is 0, the script shows “caps —”; the raid phase then only ends when the auto-buy queue is empty (no capped targets to chase).")
+MiscTab:Label(
+    "Then: (4) Auto Raid OFF. (5) Farm at the saved spot until kills reach (2 + your Ascends) × 1M. (6) Calls ConfirmAscend when your current area has NextPortal; on success, post-ascend teleport runs (and Keep aura before TP if that toggle is on). Then it loops from step (1).")
+MiscTab:Label(
+    "Turn ⬆️ Auto Ascend OFF while this runs; the cycle ascends for you and both fighting over ConfirmAscend causes confusion. If raid never starts, show AutoRaidBtn in Misc and check the status line for “Auto Raid UI: OFF”. Raid phase can time out if SP or caps block buys.")
+MiscTab:Label(
+    "The green status line above refreshes about every second: current phase, raid button state, raid timer, capped-upgrade counts during raid, farm progress / KPM, and errors (no NextPortal, failed ascend, etc.).")
 
 task.defer(function()
     pcall(function()
         if autoAscendToggle and autoAscendToggle.Set then
             autoAscendToggle.Set(states.autoAscend)
+        end
+        if autoCycleFarmToggle and autoCycleFarmToggle.Set then
+            autoCycleFarmToggle.Set(states.autoCycleFarm)
         end
     end)
 end)
@@ -3685,55 +3996,10 @@ MiscTab:Button("🎯", "Check Ascend Status", "Shows (2+Ascends)×1M kill gate v
     end)
     SLbl.Text = string.format(
         "Ascend: %s / %s kills (%s more) | ascends=%s | next → %s",
-        tostring(have), tostring(req), tostring(more), tostring(getAscends()), tostring(dest or "?"))
+        tostring(have), tostring(req), tostring(more), tostring(getAscends()),         tostring(dest or "?"))
 end)
 
-MiscTab:Section("Aura (SelectedAura + remotes)")
-MiscTab:Label("Equipped aura = Character:GetAttribute(\"SelectedAura\"). Unlock list = GetUnlockedAuras; equip = SelectAura(name).")
-local auraPreferredDropdown = MiscTab:Dropdown(
-    "Preferred aura",
-    "Choose one unlocked aura to equip. Tap Refresh if you just unlocked a new one — saved to settings.",
-    buildAuraDropdownOptions({}),
-    1,
-    function(_, val)
-        states.auraPreferredName = (type(val) == "string" and val) or ""
-        saveSettings()
-    end
-)
-local auraMaintainToggle = MiscTab:Toggle(
-    "Keep selected aura on",
-    "Every ~4s (and after respawn / post-ascend keep): if equipped ≠ preferred, fires SelectAura(preferred).",
-    states.auraMaintainSelection,
-    function(on)
-        states.auraMaintainSelection = on == true
-        saveSettings()
-        SLbl.Text = on and "Aura: maintain ON" or "Aura: maintain OFF"
-    end
-)
-MiscTab:Button("↻", "Refresh aura list", "GetUnlockedAuras → repopulates dropdown", C.sub, function()
-    local names = fetchUnlockedAuraNamesSorted()
-    auraPreferredDropdown.Refresh(buildAuraDropdownOptions(names), states.auraPreferredName)
-    SLbl.Text = (#names > 0) and ("✓ Aura list: " .. tostring(#names)) or "⚠ GetUnlockedAuras failed or empty"
-end)
-MiscTab:Button("✓", "Equip preferred now", "SelectAura only if equipped ≠ preferred and aura is unlocked", C.accent, function()
-    local r = forceSelectPreferredAuraNow()
-    if r == "fired" then
-        SLbl.Text = "✓ SelectAura → " .. tostring(states.auraPreferredName)
-    elseif r == "already" then
-        SLbl.Text = "✓ Aura already equipped: " .. tostring(states.auraPreferredName)
-    else
-        SLbl.Text = "⚠ Equip failed — set preferred, Refresh list, ensure unlocked"
-    end
-end)
-task.defer(function()
-    pcall(function()
-        local names = fetchUnlockedAuraNamesSorted()
-        auraPreferredDropdown.Refresh(buildAuraDropdownOptions(names), states.auraPreferredName)
-        if auraMaintainToggle and auraMaintainToggle.Set then
-            auraMaintainToggle.Set(states.auraMaintainSelection)
-        end
-    end)
-end)
+meleeGuiMountMiscAuraSection(MiscTab, SLbl, C)
 
 -- `;` required before `(` here: otherwise Luau parses `(function` as a call on task.defer's return value.
 ;(function()
@@ -3941,6 +4207,13 @@ MiscTab:Toggle("💾 Auto Save", "Automatically saves all toggle/slider states t
 end)
 MiscTab:Button("🛑", "Stop All Loops", "Disconnects all connections and cancels all threads", C.red, function()
     states.autoAscend  = false
+    states.autoCycleFarm = false
+    meleeAutoFarmStatus.line = "🔁 Farm cycle: OFF (Stop All)"
+    pcall(function()
+        if autoFarmCycleStatusLbl and autoFarmCycleStatusLbl.Set then
+            autoFarmCycleStatusLbl.Set(meleeAutoFarmStatus.line)
+        end
+    end)
     states.autoSacrifice = false
     states.autoTotem   = false
     states.autoManaToSP  = false
@@ -3964,6 +4237,12 @@ MiscTab:Button("🛑", "Stop All Loops", "Disconnects all connections and cancel
     end)
     pcall(function()
         if apAutoToggle and apAutoToggle.Set then apAutoToggle.Set(false) end
+    end)
+    pcall(function()
+        if autoCycleFarmToggle and autoCycleFarmToggle.Set then autoCycleFarmToggle.Set(false) end
+    end)
+    pcall(function()
+        if autoAscendToggle and autoAscendToggle.Set then autoAscendToggle.Set(false) end
     end)
     states.noclip    = false; states.godMode   = false
     states.fly       = false; states.antiAfk   = false
