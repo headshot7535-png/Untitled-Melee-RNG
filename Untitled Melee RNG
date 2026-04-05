@@ -1,7 +1,18 @@
+--[[
+  Melee RNG — Untitled mellee.lua
+  ---------------------------------------------------------------------------
+  Main chunk order (top → bottom):
+    1. Bootstrap     — NexusLib, services, LocalPlayer, GEN, cleanup
+    2. Core helpers  — character, leaderstats, remotes (R, fireR, invokeR, invokeR2)
+    3. Game data     — guild/AP constants, mobs, damage, state, settings JSON
+    4. Feature code  — GUI click helpers, ascend TP/aura, upgrade math, farm…
+    5. UI IIFE       — Lib window (tabs); kept separate for Luau local limit
+    6. Tail          — re-exec arm, deferred PlayerGui, ready status
+  ---------------------------------------------------------------------------
+]]
 
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
-
-local SCRIPT_URL     = "https://raw.githubusercontent.com/headshot7535-png/Untitled-Melee-RNG/main/Untitled%20Melee%20RNG"
+local SCRIPT_URL   = "https://raw.githubusercontent.com/headshot7535-png/Untitled-Melee-RNG/main/Untitled%20Melee%20RNG"
 
 -- ── Load NexusLib ─────────────────────────────────────────────
 local Lib
@@ -128,6 +139,18 @@ local function invokeR(name, ...)
     return ok and res or nil
 end
 
+--- Multi-return InvokeServer: ok, first, second (guild buff / AP level + GP).
+local function invokeR2(name, ...)
+    local r = R(name)
+    if not r then return false, nil, nil end
+    local args = table.pack(...)
+    local pack = { pcall(function()
+        return r:InvokeServer(table.unpack(args, 1, args.n))
+    end) }
+    if not pack[1] then return false, nil, nil end
+    return true, pack[2], pack[3]
+end
+
 -- ── Guild (GuildUIController + SharedConstants.GuildConstants) ─────────
 local _guildBuffDefs = nil
 pcall(function()
@@ -161,17 +184,6 @@ local function guildBuffNextCost(buffName, currentLevel)
     end
     local f = GUILD_BUFF_COST_FALLBACK[buffName]
     return f and f(l) or math.huge
-end
-
-local function invokeR2(name, ...)
-    local r = R(name)
-    if not r then return false, nil, nil end
-    local args = table.pack(...)
-    local pack = { pcall(function()
-        return r:InvokeServer(table.unpack(args, 1, args.n))
-    end) }
-    if not pack[1] then return false, nil, nil end
-    return true, pack[2], pack[3]
 end
 
 local function fetchGuildState()
@@ -251,39 +263,12 @@ local function parseAscendPoints(raw)
 end
 
 -- ── Live mob table (mirrors MobsClientController u19) ─────────
--- We read directly from workspace.Mobs. Each model has attribute "ID".
--- Properties confirmed: Root=HumanoidRootPart, Health via HitMob event.
--- We maintain our OWN health shadow for attack-flow control.
-local MOB_DATA = {}  -- [modelRef] = {id, health, maxHealth, boss, megaBoss, root}
+-- workspace.Mobs: Model + HumanoidRootPart + attribute "ID". No Humanoid on mobs.
+local MOB_DATA = {} -- [modelRef] = { id, model, root, boss, megaBoss }
 
-local function refreshMobData()
-    MOB_DATA = {}
-    local mobsFolder = workspace:FindFirstChild("Mobs")
-    if not mobsFolder then return end
-    -- Mobs have NO Humanoid — health is server-side only.
-    -- Valid mob = Model with HumanoidRootPart + "ID" attribute (set by SpawnMob).
-    for _, model in ipairs(mobsFolder:GetChildren()) do
-        if model:IsA("Model") and isMobAlive(model) then
-            local hrp = model:FindFirstChild("HumanoidRootPart")
-            local id  = model:GetAttribute("ID") or model.Name
-            MOB_DATA[model] = {
-                id       = id,
-                model    = model,
-                root     = hrp,
-                boss     = model:GetAttribute("Boss") == true,
-                megaBoss = model:GetAttribute("MegaBoss") == true,
-            }
-        end
-    end
-end
-
--- Valid mob: Model in workspace.Mobs + HumanoidRootPart + "ID" attribute set
--- Mobs have NO Humanoid — health is server-side only. Do NOT check Humanoid.Health.
--- "MobRootPart" CollectionService tag confirmed on HumanoidRootPart (dump line 41039).
 local function isMobAlive(model)
     if not (model and model.Parent) then return false end
     local hrp = model:FindFirstChild("HumanoidRootPart")
-    -- If the model has been destroyed by HitMob the root disappears
     return hrp ~= nil and model:GetAttribute("ID") ~= nil
 end
 
@@ -311,6 +296,25 @@ local function countAliveMobs()
         if m:IsA("Model") and isMobAlive(m) then n = n + 1 end
     end
     return n
+end
+
+local function refreshMobData()
+    MOB_DATA = {}
+    local mobsFolder = workspace:FindFirstChild("Mobs")
+    if not mobsFolder then return end
+    for _, model in ipairs(mobsFolder:GetChildren()) do
+        if model:IsA("Model") and isMobAlive(model) then
+            local hrp = model:FindFirstChild("HumanoidRootPart")
+            local id  = model:GetAttribute("ID") or model.Name
+            MOB_DATA[model] = {
+                id       = id,
+                model    = model,
+                root     = hrp,
+                boss     = model:GetAttribute("Boss") == true,
+                megaBoss = model:GetAttribute("MegaBoss") == true,
+            }
+        end
+    end
 end
 
 -- ── Damage multiplier (live from server) ──────────────────────
@@ -1094,11 +1098,11 @@ local function meleeGuiMountApTab(ApTab, SLbl, C)
     }
 end
 
--- Main chunk was hitting Luau's ~200 local register limit; UI + re-exec live in their own function.
+-- Luau ~200 locals: window UI + return SLbl live in this IIFE; re-exec init stays outside below.
 local SLbl = (function()
--- ============================================================
---  BUILD WINDOW  (tabs: Move → ESP → Areas → Upgrades → Sacrifice → Misc)
--- ============================================================
+-- --------------------------------------------------------------------------
+-- UI — Build window (tabs: Move → ESP → Areas → Upgrades → Sacrifice → Misc)
+-- --------------------------------------------------------------------------
 local Win  = Lib:Window({ title = "⚔️  Melee RNG  v1.0" })
 local SLbl = Win._status
 
@@ -1162,6 +1166,7 @@ local function makeStatusCard(page, lo, titleStr, accentCol)
              Pill=Pill, PBtn=PBtn, stroke=stroke, setState=setState }
 end
 
+-- Tabs: Move → ESP → Areas → Upgrades → Sacrifice → Guild → Ascend AP → (later) Misc
 local MoveTab = Win:Tab("🚀",  "Move")
 local ESPTab  = Win:Tab("👁️",  "ESP")
 local AreaTab = Win:Tab("🗺️",  "Areas")
@@ -1628,10 +1633,9 @@ addThread(task.spawn(function()
     end
 end))
 
--- ============================================================
---  SACRIFICE TAB UI (Win:Tab created with other tabs)
---  Rarity = weapon:GetAttribute("OneIn") on RS.Assets.Weapons (matches in-game colors)
--- ============================================================
+-- --------------------------------------------------------------------------
+-- UI — Sacrifice tab (OneIn / RS.Assets.Weapons rarity colors)
+-- --------------------------------------------------------------------------
 
 -- OneIn max per tier (sacrifice weapons with OneIn ≤ cap for selected row)
 local SAC_TIERS = {
@@ -2542,12 +2546,10 @@ end))
 
 local MiscTab = Win:Tab("⚙️", "Misc")
 
--- ============================================================
--- Cache hitbox parts so we don't scan descendants every frame
--- ── Hitbox pulse variables (Touched-only: no HitMob FireServer — game handles damage) ──
--- Data-driven (this map): BIG 500 ≫ 100k (~5.5x KPM, Test 8b — fewer physics overlap pairs).
--- Tiny 0.01 ≫ 0.05 (~4x KPM, Test 9 — mobs exit bounds more cleanly). CanTouch must be true (Test 7).
--- Combined ~40k+ KPM vs ~22k before these constants.
+-- --------------------------------------------------------------------------
+-- Misc tab — Hitbox pulse (cache parts; Touched-only, no HitMob batch)
+-- BIG 500 ≫ 100k (~5.5x KPM); tiny 0.01. Data-driven constants below.
+-- Tiny 0.01 ≫ 0.05 (~4x KPM, Test 9). CanTouch must stay true (Test 7). Combined ~40k+ KPM vs ~22k before tuning.
 local HITBOX_BIG_DEFAULT  = 500   -- map-tuned BIG (vs 100k+ = overlap hell)
 local HITBOX_BIG_LIGHT    = 350   -- low-lag preset: smaller BIG footprint
 local HITBOX_TINY_STUDS   = 0.01
@@ -3168,9 +3170,9 @@ MoveTab:Button("🌀", "Fire Nearest Machine", "Fires nearest workspace.Machines
     end
 end)
 
--- ============================================================
---  ESP TAB
--- ============================================================
+-- --------------------------------------------------------------------------
+-- UI — ESP tab
+-- --------------------------------------------------------------------------
 ESPTab:Section("Mob ESP")
 ESPTab:Toggle("👹 Mob ESP", "Billboard tags on all mobs in workspace.Mobs", states.espMobs, function(on)
     states.espMobs = on; saveSettings()
@@ -3183,9 +3185,9 @@ end)
 ESPTab:Section("Info")
 ESPTab:Label("Mob ESP attaches BillboardGui to Head/UpperTorso. Loot ESP attaches to PrimaryPart. All removed on Stop.")
 
--- ============================================================
---  AREAS TAB
--- ============================================================
+-- --------------------------------------------------------------------------
+-- UI — Areas tab
+-- --------------------------------------------------------------------------
 AreaTab:Section("Teleport to Area")
 AreaTab:Label("Areas discovered live from workspace.Areas.\nAreas require MinimumKills to unlock.")
 
@@ -3282,9 +3284,9 @@ task.spawn(function()
     end
 end)
 
--- ============================================================
---  FEATURE LOGIC LOOPS
--- ============================================================
+-- --------------------------------------------------------------------------
+-- Feature loops (same IIFE as UI — shares states / GEN)
+-- --------------------------------------------------------------------------
 
 -- ── Auto Equip Best (WeaponsUI EquipBestBtn → Remotes.EquipBest:FireServer) ──
 addThread(task.spawn(function()
@@ -3600,9 +3602,7 @@ addConn(LP.CharacterAdded:Connect(function(c)
     end)
 end))
 
--- ============================================================
--- ── Auto Ascend Loop ──────────────────────────────────────────
--- ConfirmAscend:InvokeServer() — kill gate is (2 + ascends)×1M (AscendUIController), not area MinimumKills
+-- ── Auto Ascend loop (ConfirmAscend; gate = (2 + ascends)×1M, not area MinimumKills) ──
 addThread(task.spawn(function()
     while true do
         if GEN ~= _G.MeleeRNG_Gen then break end
@@ -3805,11 +3805,10 @@ addThread(task.spawn(function()
     end
 end))
 
--- ============================================================
---  STOP BUTTON
--- ============================================================
-
--- ── Kill Rate Tracking + Ascend ETA ───────────────────────────────────────
+-- --------------------------------------------------------------------------
+-- UI — Stop button + stats row (KPM / ascend ETA / aura line)
+-- --------------------------------------------------------------------------
+-- ── Kill rate + ascend ETA helpers ─────────────────────────────────────────
 local _killHistory  = {}
 local _KILL_WINDOW  = 60
 local _lastKillCount = 0
@@ -4390,9 +4389,9 @@ local function meleeReexecArmInit()
 end
 meleeReexecArmInit()
 
--- ============================================================
---  DONE
--- ============================================================
+-- --------------------------------------------------------------------------
+-- Boot complete — walk speed, deferred PlayerGui, status line
+-- --------------------------------------------------------------------------
 do local h = getHuman(); if h then h.WalkSpeed = walkSpeedVal end end
 -- Apply saved UI button visibility on load
 task.defer(function()
