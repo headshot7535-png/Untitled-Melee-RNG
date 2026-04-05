@@ -3906,17 +3906,23 @@ local autoCycleFarmToggle = MiscTab:Toggle(
     end
 )
 
-MiscTab:Label("Notes — Auto Farm cycle (read before enabling)")
+MiscTab:Label("Notes — Auto Farm cycle (steps you can copy from source or repost)")
 MiscTab:Label(
-    "Order: (1) Teleport to your saved Ascend TP (Misc → Set Ascend TP Here). (2) Turn the game Auto Raid ON: script fires the green AutoRaidBtn + SetSetting so the client matches (needs firesignal or getconnections). (3) Auto Upgrade is forced ON until every toggled upgrade that has a level cap reaches that cap, or there are no affordable buys left.")
+    "Step 1 — Teleport to your saved Ascend TP (Misc → Ascend → Set Ascend TP Here). The cycle always returns here between loops.")
 MiscTab:Label(
-    "Raid status “X/Y below cap”: X = upgrades still under their cap, Y = how many rows count — only rows that are toggled ON on the Upgrades tab and have a numeric cap set. Toggle OFF or leave cap empty = not counted. If Y is 0, the script shows “caps —”; the raid phase then only ends when the auto-buy queue is empty (no capped targets to chase).")
+    "Step 2 — Turn in-game Auto Raid ON. The script clicks MainGUI AutoRaidBtn and fires SetSetting(AutoRaidEnabled) so the green button matches. Reliable Auto Raid needs firesignal or getconnections; otherwise toggle raid in-game.")
 MiscTab:Label(
-    "Then: (4) Auto Raid OFF. (5) Farm at the saved spot until kills reach (2 + your Ascends) × 1M. (6) Calls ConfirmAscend when your current area has NextPortal; on success, post-ascend teleport runs (and Keep aura before TP if that toggle is on). Then it loops from step (1).")
+    "Step 3 — Raid + upgrades: Auto Upgrade is forced ON for this phase. It stops when EITHER (A) every Upgrades-tab row that is toggled ON and has a numeric level cap has reached that cap, OR (B) there are no affordable buys left in the auto-buy queue. If you have zero ON+cap rows, only (B) ends the phase.")
 MiscTab:Label(
-    "Turn ⬆️ Auto Ascend OFF while this runs; the cycle ascends for you and both fighting over ConfirmAscend causes confusion. If raid never starts, show AutoRaidBtn in Misc and check the status line for “Auto Raid UI: OFF”. Raid phase can time out if SP or caps block buys.")
+    "Step 4 — Auto Raid OFF (same button + remote path as step 2). Your previous Auto Upgrade toggle is restored.")
 MiscTab:Label(
-    "The green status line above refreshes about every second: current phase, raid button state, raid timer, capped-upgrade counts during raid, farm progress / KPM, and errors (no NextPortal, failed ascend, etc.).")
+    "Step 5 — Farm at the saved TP until kills ≥ (2 + your current Ascends) × 1 million (same gate as manual ascend).")
+MiscTab:Label(
+    "Step 6 — ConfirmAscend: your current area (GetArea) must have NextPortal. On success, post-ascend teleport runs to saved TP; Keep aura before TP / maintain preferred aura apply if enabled. Then the script loops back to Step 1.")
+MiscTab:Label(
+    "Raid status “X/Y below cap”: X = how many ON+cap rows are still under cap; Y = how many rows are tracked (must be ON + cap). OFF or empty cap = not counted. If Y = 0 you see “caps —”; step 3 then only ends when the buy queue is empty.")
+MiscTab:Label(
+    "Requirements: turn ⬆️ Auto Ascend OFF while Auto Farm cycle runs (only one system should call ConfirmAscend). Show AutoRaidBtn in Misc if the game hides it. Raid phase can run up to ~45 minutes then times out if SP/caps/queue block progress. Green status line updates ~1s: phase, Auto Raid UI, timer, cap counts, farm KPM, errors.")
 
 task.defer(function()
     pcall(function()
