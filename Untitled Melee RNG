@@ -328,7 +328,7 @@ end
 local states = {
     autoEquipBest  = false,
     autoAscend     = false,
-    -- Full loop: saved Ascend TP → firesignal(AutoRaidBtn) + force auto upgrades → caps → raid OFF → farm kills → ascend → repeat (turn OFF Auto Ascend while ON)
+    -- Auto Farm cycle: TP → raid/upgrades if needed → farm → then ⬆️ Auto Ascend handles ConfirmAscend; turn both ON together
     autoCycleFarm  = false,
     farmBoss       = true,   -- ON by default: higher areas spawn bosses
     farmMegaBoss   = false,
@@ -393,8 +393,10 @@ local states = {
     perfHideOtherCharacters = false, -- other players’ Character rigs invisible locally (intrusive)
 }
 
--- Auto Farm cycle: live status line for Misc label (not in states — avoids persisting to settings JSON)
-local meleeAutoFarmStatus = { line = "🔁 Farm cycle: OFF" }
+-- Auto Farm cycle: live status (not in states — avoids persisting to settings JSON)
+-- raidPhaseActive = raid+upgrade inner loop only. farmPhaseActive = farm-kills inner loop only.
+-- Nudge raid ON only when raid phase and not farm phase (never touch raid during farming).
+local meleeAutoFarmStatus = { line = "🔁 Farm cycle: OFF", raidPhaseActive = false, farmPhaseActive = false }
 
 -- Upgrade names for save/load (must exist before saveSettings references upgradeSelected)
 local UPGRADE_ORDER = {
@@ -661,16 +663,41 @@ local function meleeAutoRaidBtnLabelIsOn(btn)
         t = btn.Text
     end
     if type(t) ~= "string" then return nil end
+    t = (t:gsub("^%s+", ""):gsub("%s+$", ""))
     if string.find(t, ": ON", 1, true) then return true end
     if string.find(t, ": OFF", 1, true) then return false end
     return nil
 end
 
+--- Farm handoff: one click only when label explicitly says ON. Never click on "?" — that can toggle OFF→ON.
+local function meleeEnsureAutoRaidOffForFarm()
+    local btn = meleeResolveAutoRaidBtn()
+    if btn then
+        pcall(function()
+            btn.Visible = true
+        end)
+    end
+    if meleeAutoRaidBtnLabelIsOn(btn) ~= true then
+        return
+    end
+    meleeFireAutoRaidClick()
+    task.wait(0.5)
+end
+
 --- Toggle Auto Raid via firesignal only; wait between tries so the label can update (double fire = OFF again).
 local function meleeSetGameAutoRaidEnabled(wantOn)
     wantOn = wantOn == true
-    local maxAttempts = wantOn and 6 or 5
-    for attempt = 1, maxAttempts do
+    if wantOn and meleeAutoFarmStatus.raidPhaseActive ~= true then
+        return meleeResolveAutoRaidBtn() ~= nil
+    end
+
+    if not wantOn then
+        meleeEnsureAutoRaidOffForFarm()
+        return meleeResolveAutoRaidBtn() ~= nil
+    end
+
+    local maxAttempts = 6
+    for _ = 1, maxAttempts do
         local btn = meleeResolveAutoRaidBtn()
         if btn then
             pcall(function()
@@ -678,21 +705,23 @@ local function meleeSetGameAutoRaidEnabled(wantOn)
             end)
         end
         local cur = meleeAutoRaidBtnLabelIsOn(btn)
-        if wantOn and cur == true then
+        if cur == true then
             break
         end
-        if not wantOn and cur ~= true then
+        if btn then
+            meleeFireAutoRaidClick()
+            task.wait(0.5)
+        else
             break
         end
-
-        meleeFireAutoRaidClick()
-        task.wait(0.5)
     end
     return meleeResolveAutoRaidBtn() ~= nil
 end
 
 local function meleeNudgeAutoRaidOnIfUiOff()
-    if meleeAutoRaidUiShort() == "ON" then return end
+    if meleeAutoFarmStatus.raidPhaseActive ~= true then return end
+    if meleeAutoFarmStatus.farmPhaseActive == true then return end
+    if meleeAutoRaidUiShort() ~= "OFF" then return end
     meleeFireAutoRaidClick()
     task.wait(0.4)
 end
@@ -3606,7 +3635,7 @@ end))
 addThread(task.spawn(function()
     while true do
         if GEN ~= _G.MeleeRNG_Gen then break end
-        if not states.autoAscend or states.autoCycleFarm then task.wait(2); continue end
+        if not states.autoAscend then task.wait(2); continue end
         pcall(function()
             local need = getAscendKillsRequired()
             if (tonumber(getKills()) or 0) < need then return end
@@ -3624,7 +3653,8 @@ addThread(task.spawn(function()
     end
 end))
 
--- ── Auto cycle: Ascend TP → Auto Raid + upgrades (caps) → farm → ascend (MobsClientController AutoRaidBtn / firesignal) ──
+-- ── Auto cycle (infinite loop): (1) TP Ascend spot → (2) check upgrades → (3) raid spend if needed → raid OFF →
+--    (4) farm until ascend kill gate → (5) wait for ⬆️ Auto Ascend / manual ascend → post-ascend TP → repeat.
 addThread(task.spawn(function()
     local RAID_POLL_SEC = 1.25
     local RAID_MAX_SEC = 2700
@@ -3639,6 +3669,7 @@ addThread(task.spawn(function()
     local function setGameAutoRaid(on)
         return meleeSetGameAutoRaidEnabled(on == true)
     end
+    --- True when no raid SP spend is needed (all capped selections at cap, or no-cap queue empty).
     local function raidSpendPhaseDone()
         local anyCap = false
         for _, name in ipairs(UPGRADE_ORDER) do
@@ -3683,61 +3714,81 @@ addThread(task.spawn(function()
             continue
         end
         pcall(function()
+            meleeAutoFarmStatus.raidPhaseActive = false
+            meleeAutoFarmStatus.farmPhaseActive = false
             meleeAutoFarmStatus.line = "🔁 TP → saved Ascend spot"
             SLbl.Text = "🔄 Cycle: TP → saved Ascend spot"
             tpAscendSaved()
             task.wait(0.65)
             if not states.autoCycleFarm or GEN ~= _G.MeleeRNG_Gen then return end
 
+            -- (2)(3) After TP: if anything still needs raid SP, turn Auto Raid ON and wait until fully capped / done.
+            local needsRaidSpend = not raidSpendPhaseDone()
             local prevAU = states.autoUpgradeOn
-            states.autoUpgradeOn = true
-            if not setGameAutoRaid(true) then
-                meleeAutoFarmStatus.line = "⚠ No AutoRaidBtn (MainGUI.OptionsList) — check PlayerGui"
-                SLbl.Text = "⚠ Cycle: AutoRaidBtn missing — enable Auto Raid in game UI"
-                task.wait(6)
-                return
-            end
-
-            meleeAutoFarmStatus.line = string.format(
-                "🔁 Raid + auto upgrade | Auto Raid: %s | %s | until caps / empty queue",
-                meleeAutoRaidUiShort(),
-                raidCappedStatusFragment())
-            SLbl.Text = "🔄 Cycle: Auto Raid ON + Auto Upgrade (until caps / empty queue)"
             local tRaid = os.clock()
-            local lastRaidUiNudge = 0.0
-            while states.autoCycleFarm and GEN == _G.MeleeRNG_Gen and os.clock() - tRaid < RAID_MAX_SEC do
-                local elapsed = os.clock() - tRaid
-                if meleeAutoRaidUiShort() == "OFF" then
-                    if elapsed - lastRaidUiNudge >= 3.5 then
-                        lastRaidUiNudge = elapsed
-                        meleeNudgeAutoRaidOnIfUiOff()
-                    end
+
+            if needsRaidSpend then
+                states.autoUpgradeOn = true
+                meleeAutoFarmStatus.raidPhaseActive = true
+                if not setGameAutoRaid(true) then
+                    meleeAutoFarmStatus.raidPhaseActive = false
+                    states.autoUpgradeOn = prevAU
+                    meleeAutoFarmStatus.line = "⚠ No AutoRaidBtn (MainGUI.OptionsList) — check PlayerGui"
+                    SLbl.Text = "⚠ Cycle: AutoRaidBtn missing — enable Auto Raid in game UI"
+                    task.wait(6)
+                    return
                 end
-                local done = raidSpendPhaseDone()
+
                 meleeAutoFarmStatus.line = string.format(
-                    "🔁 Raid + upgrade | Auto Raid UI: %s | %dm %02ds | %s | %s",
+                    "🔁 Raid + auto upgrade | Auto Raid: %s | %s | until all capped / queue empty",
                     meleeAutoRaidUiShort(),
-                    math.floor(elapsed / 60),
-                    math.floor(elapsed % 60),
-                    raidCappedStatusFragment(),
-                    done and "caps/queue done → next" or "buying…")
-                if done then break end
-                task.wait(RAID_POLL_SEC)
+                    raidCappedStatusFragment())
+                SLbl.Text = "🔄 Cycle: Auto Raid ON + Auto Upgrade (until caps / empty queue)"
+                local lastRaidUiNudge = 0.0
+                while states.autoCycleFarm and GEN == _G.MeleeRNG_Gen and os.clock() - tRaid < RAID_MAX_SEC do
+                    local elapsed = os.clock() - tRaid
+                    local done = raidSpendPhaseDone()
+                    if not done and meleeAutoRaidUiShort() == "OFF" then
+                        if elapsed - lastRaidUiNudge >= 3.5 then
+                            lastRaidUiNudge = elapsed
+                            meleeNudgeAutoRaidOnIfUiOff()
+                        end
+                    end
+                    meleeAutoFarmStatus.line = string.format(
+                        "🔁 Raid + upgrade | Auto Raid UI: %s | %dm %02ds | %s | %s",
+                        meleeAutoRaidUiShort(),
+                        math.floor(elapsed / 60),
+                        math.floor(elapsed % 60),
+                        raidCappedStatusFragment(),
+                        done and "all capped → raid OFF → farm" or "buying…")
+                    if done then break end
+                    task.wait(RAID_POLL_SEC)
+                end
+
+                meleeAutoFarmStatus.raidPhaseActive = false
+                states.autoUpgradeOn = prevAU
+
+                if not states.autoCycleFarm or GEN ~= _G.MeleeRNG_Gen then return end
+                if os.clock() - tRaid >= RAID_MAX_SEC then
+                    meleeAutoFarmStatus.line = "⚠ Raid phase timeout — check SP / upgrade caps"
+                    SLbl.Text = "⚠ Cycle: raid phase timeout — check caps / SP"
+                end
+            else
+                meleeAutoFarmStatus.raidPhaseActive = false
+                meleeAutoFarmStatus.line = string.format(
+                    "🔁 Upgrades satisfied — skip raid | %s",
+                    raidCappedStatusFragment())
+                SLbl.Text = "🔄 Cycle: upgrades satisfied — skip raid → farm"
             end
 
+            -- If Auto Raid is ON, one click OFF before farm (covers skip-raid path too).
             setGameAutoRaid(false)
-            states.autoUpgradeOn = prevAU
-
-            if not states.autoCycleFarm or GEN ~= _G.MeleeRNG_Gen then return end
-            if os.clock() - tRaid >= RAID_MAX_SEC then
-                meleeAutoFarmStatus.line = "⚠ Raid phase timeout — check SP / upgrade caps"
-                SLbl.Text = "⚠ Cycle: raid phase timeout — check caps / SP"
-            end
 
             meleeAutoFarmStatus.line = string.format("🔁 Farm kills (raid OFF) | Auto Raid UI: %s", meleeAutoRaidUiShort())
             SLbl.Text = "🔄 Cycle: farm kills at saved spot"
             tpAscendSaved()
             task.wait(0.5)
+            meleeAutoFarmStatus.farmPhaseActive = true
             while states.autoCycleFarm and GEN == _G.MeleeRNG_Gen do
                 local k = tonumber(getKills()) or 0
                 local req = getAscendKillsRequired()
@@ -3753,34 +3804,28 @@ addThread(task.spawn(function()
                 if k >= req then break end
                 task.wait(FARM_POLL_SEC)
             end
+            meleeAutoFarmStatus.farmPhaseActive = false
 
             if not states.autoCycleFarm or GEN ~= _G.MeleeRNG_Gen then return end
 
-            meleeAutoFarmStatus.line = "🔁 Ascend — ConfirmAscend"
-            local area = invokeR("GetArea")
-            local np = area and area:FindFirstChild("NextPortal")
-            if not np then
-                meleeAutoFarmStatus.line = "⚠ No NextPortal — unlock area / stand at portal"
-                SLbl.Text = "⚠ Cycle: no NextPortal — stand in unlocked area"
-                task.wait(6)
-                return
-            end
-            local dest = np:GetAttribute("Destination")
+            -- ConfirmAscend is only fired from ⬆️ Auto Ascend (or Ascend Now / game UI). Cycle waits for Ascends↑ then TP chase.
             local beforeA = tonumber(getAscends()) or 0
-            local ok = invokeR("ConfirmAscend")
-            if not ok then
-                meleeAutoFarmStatus.line = "⚠ ConfirmAscend failed — kills or requirement"
-                SLbl.Text = "⚠ Cycle: ConfirmAscend failed (kills / requirement)"
-                task.wait(8)
-                return
-            end
-            if teleportAfterAscendIfConfirmed(beforeA) then
-                meleeAutoFarmStatus.line = "🔁 Ascended → " .. tostring(dest or "?") .. " — looping"
-                SLbl.Text = "🔄 Cycle: ascended → " .. tostring(dest or "?") .. " — loop"
-            else
-                meleeAutoFarmStatus.line = "⚠ Ascend unclear — check Ascends stat"
-                SLbl.Text = "⚠ Cycle: ascend unclear — check Ascends stat"
-                task.wait(5)
+            meleeAutoFarmStatus.line =
+                "🔁 Kills met — turn ON ⬆️ Auto Ascend (or ascend manually); cycle continues after Ascends increases"
+            SLbl.Text = "🔄 Cycle: waiting for ascend (Auto Ascend / manual)"
+            while states.autoCycleFarm and GEN == _G.MeleeRNG_Gen do
+                local nowA = tonumber(getAscends()) or 0
+                if nowA > beforeA then
+                    if teleportAfterAscendIfConfirmed(beforeA) then
+                        meleeAutoFarmStatus.line = "🔁 Ascended — next loop: TP → raid/farm"
+                        SLbl.Text = "🔄 Cycle: ascended — continuing"
+                    else
+                        meleeAutoFarmStatus.line = "🔁 Ascend detected — TP chase timeout or unclear"
+                        SLbl.Text = "🔄 Cycle: ascend detected — check TP / Ascends"
+                    end
+                    break
+                end
+                task.wait(1)
             end
         end)
         task.wait(2)
@@ -3933,19 +3978,25 @@ end))
 
 MiscTab:Section("Ascend")
 autoFarmCycleStatusLbl = MiscTab:Label("🔁 Farm cycle: OFF")
-local autoAscendToggle = MiscTab:Toggle("⬆️ Auto Ascend", "When kills ≥ (2 + your Ascends) × 1M — saved to meleernq_settings.json", states.autoAscend, function(on)
+local autoAscendToggle = MiscTab:Toggle("⬆️ Auto Ascend", "When kills ≥ (2 + Ascends) × 1M — ConfirmAscend + saved TP chase. Pair with Auto Farm cycle for full loop; cycle never calls ascend.", states.autoAscend, function(on)
     states.autoAscend = on == true
     saveSettings()
     SLbl.Text = states.autoAscend and "Auto Ascend ON" or "Auto Ascend OFF"
 end)
 MiscTab:Label(
-    "Notes — Auto Ascend: watches kills and calls ConfirmAscend when you meet the formula above. It does not teleport to your saved spot, toggle Auto Raid, or run upgrades. Turn OFF when Auto Farm cycle is ON so only one system presses ascend.")
+    "Notes — Auto Ascend: runs in its own loop. When kills ≥ (2 + Ascends) × 1M, it InvokeServer(ConfirmAscend) if your area has NextPortal, then runs the saved post-ascend TP chase (same as Ascend Now on success). Works while Auto Farm cycle is ON.")
+MiscTab:Label(
+    "Notes — together: Auto Farm cycle never calls ConfirmAscend. After the cycle reaches the kill gate it waits until your Ascends stat increases, then runs the TP chase and starts the next loop. For hands-off play, turn Auto Farm cycle ON and Auto Ascend ON.")
 local autoCycleFarmToggle = MiscTab:Toggle(
     "🔁 Auto Farm cycle",
-    "Full loop: saved TP → Auto Raid + forced upgrades → raid off → farm kills → ascend → repeat. See notes below.",
+    "TP → upgrades/raid if needed → raid off → farm to ascend kills → wait for ascend (use ⬆️ Auto Ascend ON for auto).",
     states.autoCycleFarm,
     function(on)
         states.autoCycleFarm = on == true
+        if not on then
+            meleeAutoFarmStatus.raidPhaseActive = false
+            meleeAutoFarmStatus.farmPhaseActive = false
+        end
         saveSettings()
         SLbl.Text = on and "Auto Farm cycle ON" or "Auto Farm cycle OFF"
         meleeAutoFarmStatus.line = on and "🔁 Farm cycle: ON (waiting tick…)" or "🔁 Farm cycle: OFF"
@@ -3957,23 +4008,21 @@ local autoCycleFarmToggle = MiscTab:Toggle(
     end
 )
 
-MiscTab:Label("Notes — Auto Farm cycle (steps you can copy from source or repost)")
+MiscTab:Label("Notes — Auto Farm cycle (order of operations)")
 MiscTab:Label(
-    "Step 1 — Teleport to your saved Ascend TP (Misc → Ascend → Set Ascend TP Here). The cycle always returns here between loops.")
+    "Step 1 — Teleport to saved Ascend TP (below: Set Ascend TP Here). Each full loop begins with this TP.")
 MiscTab:Label(
-    "Step 2 — Turn in-game Auto Raid ON. The script runs firesignal(LP.PlayerGui.MainGUI.OptionsList.AutoRaidBtn.MouseButton1Click) (executor global). Each click toggles raid — the cycle waits for the label to update between tries.")
+    "Step 2 — Evaluate upgrades: Upgrades-tab rows that are ON with a numeric cap must reach that cap; rows ON without a cap buy until the auto-buy queue is empty. If nothing needs raid SP, the raid step is skipped.")
 MiscTab:Label(
-    "Step 3 — Raid + upgrades: Auto Upgrade is forced ON for this phase. It stops when EITHER (A) every Upgrades-tab row that is toggled ON and has a numeric level cap has reached that cap, OR (B) there are no affordable buys left in the auto-buy queue. If you have zero ON+cap rows, only (B) ends the phase.")
+    "Step 3 — Raid + upgrades (only if step 2 needs spend): if Auto Raid shows OFF, the script turns it ON (firesignal AutoRaidBtn). Auto Upgrade is forced ON until step 2 is satisfied, then Auto Raid is turned OFF if it still shows ON.")
 MiscTab:Label(
-    "Step 4 — Auto Raid OFF (same button + remote path as step 2). Your previous Auto Upgrade toggle is restored.")
+    "Step 4 — Farm at the saved TP until kills ≥ (2 + current Ascends) × 1 million (same formula as ⬆️ Auto Ascend).")
 MiscTab:Label(
-    "Step 5 — Farm at the saved TP until kills ≥ (2 + your current Ascends) × 1 million (same gate as manual ascend).")
+    "Step 5 — Ascend is not done by the cycle. Leave ⬆️ Auto Ascend ON to call ConfirmAscend when the game allows (NextPortal in current area, server accepts). Or use Ascend Now / the game UI. The cycle detects when Ascends goes up, runs post-ascend TP to the saved spot, then goes back to Step 1.")
 MiscTab:Label(
-    "Step 6 — ConfirmAscend: your current area (GetArea) must have NextPortal. On success, post-ascend teleport runs to saved TP; Keep aura before TP / maintain preferred aura apply if enabled. Then the script loops back to Step 1.")
+    "Raid line “X/Y below cap”: X = ON+cap rows still under cap; Y = how many ON+cap rows exist. If Y = 0 you see “caps —”; the raid step then ends only when the buy queue is empty.")
 MiscTab:Label(
-    "Raid status “X/Y below cap”: X = how many ON+cap rows are still under cap; Y = how many rows are tracked (must be ON + cap). OFF or empty cap = not counted. If Y = 0 you see “caps —”; step 3 then only ends when the buy queue is empty.")
-MiscTab:Label(
-    "Requirements: turn ⬆️ Auto Ascend OFF while Auto Farm cycle runs (only one system should call ConfirmAscend). Show AutoRaidBtn in Misc if the game hides it. Raid phase can run up to ~45 minutes then times out if SP/caps/queue block progress. Green status line updates ~1s: phase, Auto Raid UI, timer, cap counts, farm KPM, errors.")
+    "Tips: use “Show Auto Raid Button” in Misc if OptionsList hides the button. Raid step can run up to ~45 minutes then time out if SP, caps, or queue block progress. If only the cycle is ON at the kill gate, you stay on “waiting for ascend” until you ascend manually or enable Auto Ascend.")
 
 task.defer(function()
     pcall(function()
@@ -3986,7 +4035,7 @@ task.defer(function()
     end)
 end)
 
-MiscTab:Label("Post-ascend teleport: stand where you want, tap Set — saved with settings.")
+MiscTab:Label("Post-ascend teleport: stand where you want, tap Set — used by ⬆️ Auto Ascend, Ascend Now, and the farm cycle after it sees Ascends increase.")
 local ascendTpLbl = MiscTab:Label("")
 local function refreshAscendTpLbl()
     ascendTpLbl.Set("Saved TP (+3 studs Y): " .. formatAscendTpSaved())
@@ -4265,6 +4314,8 @@ end)
 MiscTab:Button("🛑", "Stop All Loops", "Disconnects all connections and cancels all threads", C.red, function()
     states.autoAscend  = false
     states.autoCycleFarm = false
+    meleeAutoFarmStatus.raidPhaseActive = false
+    meleeAutoFarmStatus.farmPhaseActive = false
     meleeAutoFarmStatus.line = "🔁 Farm cycle: OFF (Stop All)"
     pcall(function()
         if autoFarmCycleStatusLbl and autoFarmCycleStatusLbl.Set then
