@@ -324,7 +324,7 @@ end
 local states = {
     autoEquipBest  = false,
     autoAscend     = false,
-    -- Full loop: saved Ascend TP → SetSetting AutoRaid + force auto upgrades → caps → raid OFF → farm kills → ascend → repeat (turn OFF Auto Ascend while ON)
+    -- Full loop: saved Ascend TP → firesignal(AutoRaidBtn) + force auto upgrades → caps → raid OFF → farm kills → ascend → repeat (turn OFF Auto Ascend while ON)
     autoCycleFarm  = false,
     farmBoss       = true,   -- ON by default: higher areas spawn bosses
     farmMegaBoss   = false,
@@ -597,32 +597,42 @@ local function hrpNearAscendTp()
 end
 
 -- Post-ascend aura roll (AuraRollUI.Options.ConfirmBtn = KEEP AURA) — dump AuraRollController
-local _firesignal = rawget(_G, "firesignal")
 local _getconnections = rawget(_G, "getconnections")
 local AURA_KEEP_POLL_SEC      = 0.2
 local AURA_KEEP_MAX_WAIT_SEC  = 90
 local AURA_NO_ROLL_SKIP_SEC   = 8
 
-local function fireGuiButtonClick(btn)
-    if not btn then return false end
-    local sig = btn.MouseButton1Click
-    if type(_firesignal) == "function" and pcall(_firesignal, sig) then
+local function fireGuiSignal(sig)
+    if not sig then return false end
+    local fs = rawget(_G, "firesignal")
+    if type(fs) == "function" and pcall(fs, sig) then
         return true
     end
     if type(_getconnections) == "function" then
         local ok, conns = pcall(_getconnections, sig)
         if ok and type(conns) == "table" then
-            local ran = false
             for _, c in ipairs(conns) do
                 if type(c) == "table" and type(c.Function) == "function" then
                     pcall(c.Function)
-                    ran = true
+                    return true
                 end
             end
-            if ran then return true end
         end
     end
     return false
+end
+
+local function fireGuiButtonClick(btn)
+    if not btn then return false end
+    return fireGuiSignal(btn.MouseButton1Click)
+end
+
+--- MobsClientController: only MouseButton1Click toggles local Auto Raid state (dump).
+local function meleeFireAutoRaidClick()
+    pcall(function()
+        local btn = LP.PlayerGui.MainGUI.OptionsList.AutoRaidBtn
+        firesignal(btn.MouseButton1Click)
+    end)
 end
 
 local function meleeResolveAutoRaidBtn()
@@ -638,38 +648,48 @@ end
 --- nil if label missing / unrecognized; true/false from "AUTO RAID: ON|OFF"
 local function meleeAutoRaidBtnLabelIsOn(btn)
     if not btn then return nil end
+    local t
     local tl = btn:FindFirstChild("TextLabel")
-    local t = tl and tl.Text
+    if tl and type(tl.Text) == "string" then
+        t = tl.Text
+    elseif (btn:IsA("TextButton") or btn:IsA("TextLabel")) and type(btn.Text) == "string" then
+        t = btn.Text
+    end
     if type(t) ~= "string" then return nil end
     if string.find(t, ": ON", 1, true) then return true end
     if string.find(t, ": OFF", 1, true) then return false end
     return nil
 end
 
---- Client script syncs Auto Raid only on button click; FireServer alone can leave UI + u205 stale.
+--- Toggle Auto Raid via firesignal only; wait between tries so the label can update (double fire = OFF again).
 local function meleeSetGameAutoRaidEnabled(wantOn)
     wantOn = wantOn == true
-    local btn = meleeResolveAutoRaidBtn()
-    if btn then
-        pcall(function()
-            btn.Visible = true
-        end)
-        local cur = meleeAutoRaidBtnLabelIsOn(btn)
-        if cur == false and wantOn or cur == true and not wantOn then
-            fireGuiButtonClick(btn)
-            task.wait(0.12)
-        elseif cur == nil and wantOn then
-            fireGuiButtonClick(btn)
-            task.wait(0.12)
+    local maxAttempts = wantOn and 6 or 5
+    for attempt = 1, maxAttempts do
+        local btn = meleeResolveAutoRaidBtn()
+        if btn then
+            pcall(function()
+                btn.Visible = true
+            end)
         end
+        local cur = meleeAutoRaidBtnLabelIsOn(btn)
+        if wantOn and cur == true then
+            break
+        end
+        if not wantOn and cur ~= true then
+            break
+        end
+
+        meleeFireAutoRaidClick()
+        task.wait(0.5)
     end
-    local rs = R("SetSetting")
-    if rs then
-        pcall(function()
-            rs:FireServer("AutoRaidEnabled", wantOn)
-        end)
-    end
-    return btn ~= nil or rs ~= nil
+    return meleeResolveAutoRaidBtn() ~= nil
+end
+
+local function meleeNudgeAutoRaidOnIfUiOff()
+    if meleeAutoRaidUiShort() == "ON" then return end
+    meleeFireAutoRaidClick()
+    task.wait(0.4)
 end
 
 local function meleeAutoRaidUiShort()
@@ -3579,7 +3599,7 @@ addThread(task.spawn(function()
     end
 end))
 
--- ── Auto cycle: Ascend TP → Auto Raid + upgrades (caps) → farm → ascend (MobsClientController SetSetting / GetSetting) ──
+-- ── Auto cycle: Ascend TP → Auto Raid + upgrades (caps) → farm → ascend (MobsClientController AutoRaidBtn / firesignal) ──
 addThread(task.spawn(function()
     local RAID_POLL_SEC = 1.25
     local RAID_MAX_SEC = 2700
@@ -3647,8 +3667,8 @@ addThread(task.spawn(function()
             local prevAU = states.autoUpgradeOn
             states.autoUpgradeOn = true
             if not setGameAutoRaid(true) then
-                meleeAutoFarmStatus.line = "⚠ No Auto Raid control (SetSetting / AutoRaidBtn) — use game UI"
-                SLbl.Text = "⚠ Cycle: SetSetting missing — enable Auto Raid in game UI"
+                meleeAutoFarmStatus.line = "⚠ No AutoRaidBtn (MainGUI.OptionsList) — check PlayerGui"
+                SLbl.Text = "⚠ Cycle: AutoRaidBtn missing — enable Auto Raid in game UI"
                 task.wait(6)
                 return
             end
@@ -3659,8 +3679,15 @@ addThread(task.spawn(function()
                 raidCappedStatusFragment())
             SLbl.Text = "🔄 Cycle: Auto Raid ON + Auto Upgrade (until caps / empty queue)"
             local tRaid = os.clock()
+            local lastRaidUiNudge = 0.0
             while states.autoCycleFarm and GEN == _G.MeleeRNG_Gen and os.clock() - tRaid < RAID_MAX_SEC do
                 local elapsed = os.clock() - tRaid
+                if meleeAutoRaidUiShort() == "OFF" then
+                    if elapsed - lastRaidUiNudge >= 3.5 then
+                        lastRaidUiNudge = elapsed
+                        meleeNudgeAutoRaidOnIfUiOff()
+                    end
+                end
                 local done = raidSpendPhaseDone()
                 meleeAutoFarmStatus.line = string.format(
                     "🔁 Raid + upgrade | Auto Raid UI: %s | %dm %02ds | %s | %s",
@@ -3910,7 +3937,7 @@ MiscTab:Label("Notes — Auto Farm cycle (steps you can copy from source or repo
 MiscTab:Label(
     "Step 1 — Teleport to your saved Ascend TP (Misc → Ascend → Set Ascend TP Here). The cycle always returns here between loops.")
 MiscTab:Label(
-    "Step 2 — Turn in-game Auto Raid ON. The script clicks MainGUI AutoRaidBtn and fires SetSetting(AutoRaidEnabled) so the green button matches. Reliable Auto Raid needs firesignal or getconnections; otherwise toggle raid in-game.")
+    "Step 2 — Turn in-game Auto Raid ON. The script runs firesignal(LP.PlayerGui.MainGUI.OptionsList.AutoRaidBtn.MouseButton1Click) (executor global). Each click toggles raid — the cycle waits for the label to update between tries.")
 MiscTab:Label(
     "Step 3 — Raid + upgrades: Auto Upgrade is forced ON for this phase. It stops when EITHER (A) every Upgrades-tab row that is toggled ON and has a numeric level cap has reached that cap, OR (B) there are no affordable buys left in the auto-buy queue. If you have zero ON+cap rows, only (B) ends the phase.")
 MiscTab:Label(
