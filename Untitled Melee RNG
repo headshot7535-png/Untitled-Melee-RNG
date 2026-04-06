@@ -343,6 +343,11 @@ local states = {
     autoSave       = true,
     showAutoRaid   = false,
     showHideMobs   = false,
+    -- MainGUI.GeneralUI (client visibility only; see applyMeleeGameUiHiding)
+    uiHideManaKills = false, -- ManaFrame + KillsFrame + StageProgress (combat bar)
+    uiHideMiniRoll  = false, -- MiniRollFrame (mini-roll animations UI)
+    uiHideHud       = false, -- entire GeneralUI (hides all of the above while ON)
+    uiHideNotifications = false, -- MainGUI.NotifFrame (NotifUIManager / SP & sacrifice toasts)
     autoReExec     = false,
     hitboxPulse    = false,
     hitboxDutyCycle  = 2,  -- BIG on 1 frame per N heartbeats (2 = half the frames big, old behavior; 6+ = mostly tiny, less physics lag)
@@ -372,8 +377,8 @@ local states = {
     -- Totem of Fortune — TotemConfirm(weaponName); cap 25 + AP level×5; 1h CD when server returns false
     -- Filters are separate from Fountain sacrifice (own color cap + keep qty)
     autoTotem           = false,
-    totemFilterColor    = false,  -- only weapons in selected OneIn *band* (not “up through”; Fountain stays ≤ cap)
-    totemRarityCapIdx   = 1,
+    totemFilterColor    = true,   -- Totem requires this ON; default ON for Galactic-band auto
+    totemRarityCapIdx   = 7,      -- 7 = Galactic (1M,7M] OneIn; change dropdown for other tiers
     totemKeepQty        = 0,
     totemDoneThisCycle  = 0,
     totemCapHitUnix     = nil, -- os.time() when server capped (starts 1h cycle lock)
@@ -387,6 +392,7 @@ local states = {
     perfHideAllEffects   = false,
     perfDisableShadows   = false, -- Lighting.GlobalShadows
     perfHideLootDrops    = false, -- workspace.Loot (dump LootController)
+    perfHideMobManaOrbs  = false, -- MobsClientController: script.Mana → workspace (pink pickup; not under Loot)
     perfMuteWorldSounds  = false, -- Sound instances under workspace
     perfCompatLighting   = false, -- Lighting.Technology → Compatibility
     perfLowGraphicsQuality = false, -- UserGameSettings quality (executor/client dependent)
@@ -569,10 +575,15 @@ states.perfHideOwnWeapons = states.perfHideOwnWeapons == true
 states.perfHideAllEffects = states.perfHideAllEffects == true
 states.perfDisableShadows = states.perfDisableShadows == true
 states.perfHideLootDrops = states.perfHideLootDrops == true
+states.perfHideMobManaOrbs = states.perfHideMobManaOrbs == true
 states.perfMuteWorldSounds = states.perfMuteWorldSounds == true
 states.perfCompatLighting = states.perfCompatLighting == true
 states.perfLowGraphicsQuality = states.perfLowGraphicsQuality == true
 states.perfHideOtherCharacters = states.perfHideOtherCharacters == true
+states.uiHideManaKills = states.uiHideManaKills == true
+states.uiHideMiniRoll  = states.uiHideMiniRoll == true
+states.uiHideHud       = states.uiHideHud == true
+states.uiHideNotifications = states.uiHideNotifications == true
 states.guildSpReserve = math.clamp(math.floor(tonumber(states.guildSpReserve) or 0), 0, 100000000)
 -- Totem CD/cap from LS applied in totem block (after TOTEM_CYCLE_SEC) + sanitize vs os.time()
 
@@ -849,6 +860,55 @@ local function formatAscendTpSaved()
         tonumber(states.ascendAfterTpZ) or DEF_ASCEND_TP_Z)
 end
 
+--- MainGUI: GeneralUI (HUD) + NotifFrame (stacked toasts — NotifUIManager, Remotes.SendNotification).
+local function applyMeleeGameUiHiding(force)
+    local anyHide = states.uiHideHud or states.uiHideManaKills or states.uiHideMiniRoll or states.uiHideNotifications
+    if not force and not anyHide then
+        return
+    end
+    pcall(function()
+        local pg = LP:FindFirstChild("PlayerGui")
+        if not pg then return end
+        local main = pg:FindFirstChild("MainGUI")
+        if not main then return end
+
+        local notif = main:FindFirstChild("NotifFrame")
+        if notif and notif:IsA("GuiObject") then
+            if states.uiHideNotifications then
+                notif.Visible = false
+            elseif force then
+                notif.Visible = true
+            end
+        end
+
+        local gen = main:FindFirstChild("GeneralUI")
+        if not gen or not gen:IsA("GuiObject") then return end
+        if states.uiHideHud then
+            gen.Visible = false
+            return
+        end
+        -- Never force gen.Visible = true here — the game sets it during rolls/menus; that caused HUD flashing every 2s.
+
+        local mf = gen:FindFirstChild("ManaFrame")
+        local kf = gen:FindFirstChild("KillsFrame")
+        local mrf = gen:FindFirstChild("MiniRollFrame")
+        local st = gen:FindFirstChild("StageProgress")
+        local showMK = not states.uiHideManaKills
+        if mf and mf:IsA("GuiObject") then mf.Visible = showMK end
+        if kf and kf:IsA("GuiObject") then kf.Visible = showMK end
+        if st and st:IsA("GuiObject") then st.Visible = showMK end
+        local showMini = not states.uiHideMiniRoll
+        if mrf and mrf:IsA("GuiObject") then mrf.Visible = showMini end
+    end)
+end
+
+addConn(RunService.Heartbeat:Connect(function()
+    if GEN ~= _G.MeleeRNG_Gen then return end
+    if states.uiHideHud or states.uiHideManaKills or states.uiHideMiniRoll or states.uiHideNotifications then
+        applyMeleeGameUiHiding()
+    end
+end))
+
 -- ── Aura (SelectedAura attribute + GetUnlockedAuras / SelectAura) ───────────
 local function getEquippedAuraName()
     local ch = LP.Character
@@ -972,6 +1032,217 @@ local function meleeGuiMountMiscAuraSection(MiscTab, SLbl, C)
             end
         end)
     end)
+end
+
+-- Misc → Ascend + farm cycle toggles + TP buttons (Luau ~200 locals in main UI IIFE).
+local function meleeGuiMountMiscAscendSection(MiscTab, SLbl, C)
+    MiscTab:Section("Ascend")
+    local autoFarmCycleStatusLbl = MiscTab:Label("🔁 Farm cycle: OFF")
+    local autoAscendToggle = MiscTab:Toggle("⬆️ Auto Ascend", "When kills ≥ (2 + Ascends) × 1M — ConfirmAscend + saved TP chase. Pair with Auto Farm cycle for full loop; cycle never calls ascend.", states.autoAscend, function(on)
+        states.autoAscend = on == true
+        saveSettings()
+        SLbl.Text = states.autoAscend and "Auto Ascend ON" or "Auto Ascend OFF"
+    end)
+    MiscTab:Label(
+        "Notes — Auto Ascend: runs in its own loop. When kills ≥ (2 + Ascends) × 1M, it InvokeServer(ConfirmAscend) if your area has NextPortal, then runs the saved post-ascend TP chase (same as Ascend Now on success). Works while Auto Farm cycle is ON.")
+    MiscTab:Label(
+        "Notes — together: Auto Farm cycle never calls ConfirmAscend. After the cycle reaches the kill gate it waits until your Ascends stat increases, then runs the TP chase and starts the next loop. For hands-off play, turn Auto Farm cycle ON and Auto Ascend ON.")
+    local autoCycleFarmToggle = MiscTab:Toggle(
+        "🔁 Auto Farm cycle",
+        "TP → upgrades/raid if needed → raid off → farm to ascend kills → wait for ascend (use ⬆️ Auto Ascend ON for auto).",
+        states.autoCycleFarm,
+        function(on)
+            states.autoCycleFarm = on == true
+            if not on then
+                meleeAutoFarmStatus.raidPhaseActive = false
+                meleeAutoFarmStatus.farmPhaseActive = false
+            end
+            saveSettings()
+            SLbl.Text = on and "Auto Farm cycle ON" or "Auto Farm cycle OFF"
+            meleeAutoFarmStatus.line = on and "🔁 Farm cycle: ON (waiting tick…)" or "🔁 Farm cycle: OFF"
+            pcall(function()
+                if autoFarmCycleStatusLbl and autoFarmCycleStatusLbl.Set then
+                    autoFarmCycleStatusLbl.Set(meleeAutoFarmStatus.line)
+                end
+            end)
+        end
+    )
+
+    MiscTab:Label("Notes — Auto Farm cycle (order of operations)")
+    MiscTab:Label(
+        "Step 1 — Teleport to saved Ascend TP (below: Set Ascend TP Here). Each full loop begins with this TP.")
+    MiscTab:Label(
+        "Step 2 — Evaluate upgrades: Upgrades-tab rows that are ON with a numeric cap must reach that cap; rows ON without a cap buy until the auto-buy queue is empty. If nothing needs raid SP, the raid step is skipped.")
+    MiscTab:Label(
+        "Step 3 — Raid + upgrades (only if step 2 needs spend): if Auto Raid shows OFF, the script turns it ON (firesignal AutoRaidBtn). Auto Upgrade is forced ON until step 2 is satisfied, then Auto Raid is turned OFF if it still shows ON.")
+    MiscTab:Label(
+        "Step 4 — Farm at the saved TP until kills ≥ (2 + current Ascends) × 1 million (same formula as ⬆️ Auto Ascend).")
+    MiscTab:Label(
+        "Step 5 — Ascend is not done by the cycle. Leave ⬆️ Auto Ascend ON to call ConfirmAscend when the game allows (NextPortal in current area, server accepts). Or use Ascend Now / the game UI. The cycle detects when Ascends goes up, runs post-ascend TP to the saved spot, then goes back to Step 1.")
+    MiscTab:Label(
+        "Raid line “X/Y below cap”: X = ON+cap rows still under cap; Y = how many ON+cap rows exist. If Y = 0 you see “caps —”; the raid phase then ends only when the buy queue is empty.")
+    MiscTab:Label(
+        "Tips: use “Show Auto Raid Button” in Misc if OptionsList hides the button. Raid step can run up to ~45 minutes then time out if SP, caps, or queue block progress. If only the cycle is ON at the kill gate, you stay on “waiting for ascend” until you ascend manually or enable Auto Ascend.")
+
+    task.defer(function()
+        pcall(function()
+            if autoAscendToggle and autoAscendToggle.Set then
+                autoAscendToggle.Set(states.autoAscend)
+            end
+            if autoCycleFarmToggle and autoCycleFarmToggle.Set then
+                autoCycleFarmToggle.Set(states.autoCycleFarm)
+            end
+        end)
+    end)
+
+    MiscTab:Label("Post-ascend teleport: stand where you want, tap Set — used by ⬆️ Auto Ascend, Ascend Now, and the farm cycle after it sees Ascends increase.")
+    local ascendTpLbl = MiscTab:Label("")
+    local function refreshAscendTpLbl()
+        ascendTpLbl.Set("Saved TP (+3 studs Y): " .. formatAscendTpSaved())
+    end
+    refreshAscendTpLbl()
+
+    local ascendAuraKeepToggle = MiscTab:Toggle("✨ Keep aura before Ascend TP", "Waits for AuraRollUI, fires KEEP (ConfirmBtn), then chases saved TP. Off = TP immediately after ascend. Needs firesignal/getconnections or falls back to UI cleanup.", states.ascendAuraKeepBeforeTp, function(on)
+        states.ascendAuraKeepBeforeTp = on == true
+        saveSettings()
+        SLbl.Text = on and "Ascend: keep aura before TP ON" or "Ascend: keep aura before TP OFF"
+    end)
+    task.defer(function()
+        pcall(function()
+            if ascendAuraKeepToggle and ascendAuraKeepToggle.Set then
+                ascendAuraKeepToggle.Set(states.ascendAuraKeepBeforeTp)
+            end
+        end)
+    end)
+
+    MiscTab:Button("📍", "Set Ascend TP Here", "Saves HumanoidRootPart position as after-ascend teleport target", C.green, function()
+        local root = getRoot()
+        if not root then SLbl.Text = "⚠ No character"; return end
+        local p = root.Position
+        states.ascendAfterTpX = p.X
+        states.ascendAfterTpY = p.Y
+        states.ascendAfterTpZ = p.Z
+        saveSettings()
+        refreshAscendTpLbl()
+        SLbl.Text = "✓ Ascend TP saved — " .. formatAscendTpSaved()
+    end)
+    MiscTab:Button("↩", "Reset Ascend TP to Default", "Forgotten Valley coords (496.9, 222.1, -7380.4)", C.sub, function()
+        states.ascendAfterTpX = DEF_ASCEND_TP_X
+        states.ascendAfterTpY = DEF_ASCEND_TP_Y
+        states.ascendAfterTpZ = DEF_ASCEND_TP_Z
+        saveSettings()
+        refreshAscendTpLbl()
+        SLbl.Text = "✓ Ascend TP reset to default"
+    end)
+
+    MiscTab:Button("⬆️", "Ascend Now", "ConfirmAscend — then TP only if Ascends stat increases", C.gold, function()
+        local beforeA = tonumber(getAscends()) or 0
+        local ok = invokeR("ConfirmAscend")
+        if not ok then
+            SLbl.Text = "⚠ Not ready (kill requirement not met)"
+            return
+        end
+        if teleportAfterAscendIfConfirmed(beforeA) then
+            SLbl.Text = "✓ Ascended — TP " .. formatAscendTpSaved()
+        else
+            SLbl.Text = "⚠ Ascends unchanged — no TP (server did not apply ascend?)"
+        end
+    end)
+    MiscTab:Button("🎯", "Check Ascend Status", "Shows (2+Ascends)×1M kill gate vs your kills + next portal", C.accent, function()
+        local req = getAscendKillsRequired()
+        local have = tonumber(getKills()) or 0
+        local more = math.max(0, req - have)
+        local dest = nil
+        pcall(function()
+            local area = invokeR("GetArea")
+            if not area then return end
+            local np = area:FindFirstChild("NextPortal")
+            if not np then return end
+            dest = np:GetAttribute("Destination")
+        end)
+        SLbl.Text = string.format(
+            "Ascend: %s / %s kills (%s more) | ascends=%s | next → %s",
+            tostring(have), tostring(req), tostring(more), tostring(getAscends()), tostring(dest or "?"))
+    end)
+
+    return {
+        autoFarmCycleStatusLbl = autoFarmCycleStatusLbl,
+        autoAscendToggle = autoAscendToggle,
+        autoCycleFarmToggle = autoCycleFarmToggle,
+        ascendAuraKeepToggle = ascendAuraKeepToggle,
+        refreshAscendTpLbl = refreshAscendTpLbl,
+    }
+end
+
+-- Misc → Stats labels + KPM thread + Ascend block + Aura (own function — main UI IIFE hits Luau’s ~200 local limit).
+local function meleeGuiMountMiscStatsLabelsAscendAura(MiscTab, SLbl, C, guildApGetter, getKillRate, getAscendETA, fmtTime)
+    MiscTab:Section("Stats & Kill Rate")
+    local StatsLbl = MiscTab:Label("Kills: — | Mana: — | SP: — | Ascends: —")
+    local KPMLbl   = MiscTab:Label("KPM: — | ETA ascend: —")
+    local ETALbl   = MiscTab:Label("Ascend: — / — kills —")
+    local AuraStatLbl = MiscTab:Label("Aura: equipped — | roll UI —")
+
+    local miscAscendGui = meleeGuiMountMiscAscendSection(MiscTab, SLbl, C)
+    meleeGuiMountMiscAuraSection(MiscTab, SLbl, C)
+
+    addThread(task.spawn(function()
+        while true do
+            if GEN ~= _G.MeleeRNG_Gen then break end
+            task.wait(1)
+            local kpm = getKillRate()
+            pcall(function()
+                StatsLbl.Set(string.format("Kills: %s | Mana: %s | SP: %s | Ascends: %s",
+                    tostring(getKills()), tostring(getMana()), tostring(getSP()), tostring(getAscends())))
+                local guildStatusLbl, apStatusLbl = guildApGetter()
+                if guildStatusLbl and guildStatusLbl.Set then
+                    local g = fetchGuildState()
+                    if g then
+                        local own = tostring(g.Owner) == tostring(LP.UserId)
+                        guildStatusLbl.Set(string.format(
+                            "Guild: %s | GP: %s | %s",
+                            tostring(g.Name or "?"),
+                            tostring(g.GuildPoints or 0),
+                            own and "owner" or "member"))
+                    else
+                        guildStatusLbl.Set("Guild: — (join/create in game)")
+                    end
+                end
+                if apStatusLbl and apStatusLbl.Set then
+                    local ap = parseAscendPoints(invokeR("GetAscendPoints"))
+                    apStatusLbl.Set(string.format("Ascend Points: %s (castle statue upgrades)", tostring(ap)))
+                end
+                local dest, killsNeeded, req = getAscendETA()
+                if req then
+                    local etaSecs = (kpm>0 and killsNeeded>0) and (killsNeeded/kpm*60) or nil
+                    local etaStr  = etaSecs and fmtTime(etaSecs) or (killsNeeded==0 and "READY" or "—")
+                    local destStr = dest and tostring(dest) or "?"
+                    KPMLbl.Set(string.format("KPM: %.1f | ETA ascend → %s: %s", kpm, destStr, etaStr))
+                    ETALbl.Set(string.format("Ascend: %s / %s kills (%s more) → %s",
+                        tostring(getKills()), tostring(req), tostring(killsNeeded), destStr))
+                else
+                    KPMLbl.Set(string.format("KPM: %.1f | Ascend: —", kpm))
+                    ETALbl.Set("Ascend: —")
+                end
+                local eqA = getEquippedAuraName()
+                local rollA = getRolledAuraNameFromRollUi()
+                AuraStatLbl.Set(string.format(
+                    "Aura: equipped %s | roll UI %s | preferred %s",
+                    eqA or "—",
+                    rollA or "—",
+                    (states.auraPreferredName ~= "" and states.auraPreferredName) or "—"))
+                local fc = miscAscendGui and miscAscendGui.autoFarmCycleStatusLbl
+                if fc and fc.Set then
+                    if states.autoCycleFarm then
+                        fc.Set(meleeAutoFarmStatus.line)
+                    else
+                        fc.Set("🔁 Farm cycle: OFF")
+                    end
+                end
+            end)
+        end
+    end))
+
+    return miscAscendGui
 end
 
 -- Guild / AP tab UI in separate functions (Luau: `do` does not reduce locals; only nested functions do).
@@ -1127,7 +1398,7 @@ local function meleeGuiMountApTab(ApTab, SLbl, C)
     }
 end
 
--- Luau ~200 locals: window UI + return SLbl live in this IIFE; re-exec init stays outside below.
+-- Luau ~200 locals: window UI + return SLbl live in this IIFE; heavy Misc blocks use meleeGuiMountMisc* helpers (Stats+Ascend+Aura is its own function); re-exec init stays outside below.
 local SLbl = (function()
 -- --------------------------------------------------------------------------
 -- UI — Build window (tabs: Move → ESP → Areas → Upgrades → Sacrifice → Misc)
@@ -1797,7 +2068,8 @@ local TOTEM_CYCLE_SEC       = 3600
 local TOTEM_BASE_MAX        = 25
 local TOTEM_ACTION_DELAY_SEC = 30 -- one-time settle delay right after hourly CD ends
 local TOTEM_REJECT_BACKOFF_SEC = 45 -- after server false: don't spam InvokeServer (fewer red toasts)
-local TOTEM_MIN_INVOKE_GAP_SEC = 6 -- Cobalt is manual (~slow); fast auto can trip server / spam red ERROR
+local TOTEM_AUTO_TICK_SEC      = 0.35 -- how often Auto Totem retries (gap still applies between invokes)
+local TOTEM_MIN_INVOKE_GAP_SEC = 2.75 -- min seconds between TotemConfirm invokes (lower = faster; too low may ERROR spam)
 local TOTEM_SKIP_AFTER_REJECT_SEC = 180 -- server false for this weapon name: try other picks for a few minutes
 local TOTEM_CONFIRM_WINDOW_SEC = 1.2 -- only count if no red ERROR arrives in this window
 local _totemLastConfirmClock = 0
@@ -2232,7 +2504,18 @@ local function totemExecuteNext()
     _totemLastConfirmClock = os.clock()
     -- Cobalt-style: one string = that row's inventory weapon name.
     local remoteName = totemRemoteWeaponName(w.name)
-    vprint(string.format("[MeleeRNG/Totem] %d/%d in color · inv=%q -> send=%q", idx, nCand, w.name, remoteName))
+    local bandIdx = math.clamp(math.floor(tonumber(states.totemRarityCapIdx) or 7), 1, #SAC_TIERS)
+    local bandName = SAC_TIERS[bandIdx].name
+    local oneInTierStr = select(1, sacTierFromOneIn(w.oneIn))
+    vprint(string.format(
+        "[MeleeRNG/Totem] %s band · %d/%d · OneIn tier %s · inv=%q -> send=%q",
+        bandName,
+        idx,
+        nCand,
+        oneInTierStr,
+        w.name,
+        remoteName
+    ))
     local invokeOk, res = pcall(function() return tr:InvokeServer(remoteName) end)
     if not invokeOk then
         invokeOk, res = pcall(function() return tr:InvokeServer(remoteName, w.type) end)
@@ -2270,7 +2553,14 @@ local function totemExecuteNext()
         updateTotemStatusLbl()
     end)
     advanceTotemRoundRobin()
-    return true, w.name
+    local okMsg = string.format(
+        '%s (selected band) · inv "%s" → TotemConfirm("%s") · %s',
+        bandName,
+        w.name,
+        remoteName,
+        oneInTierStr
+    )
+    return true, okMsg
 end
 
 -- Fix JSON that has totemDoneThisCycle >= max but no totemCapHitUnix (never showed hourly CD)
@@ -2359,7 +2649,7 @@ local totemKeepSlider = SacTab:Slider("Totem — always keep qty", "Per weapon t
     states.totemKeepQty = math.floor(v)
     saveSettings()
 end)
-SacTab:Label("Totem color = OneIn range (e.g. all Galactic). Auto cycles those weapons and calls TotemConfirm(each real name). Optional: only ✓ list names to narrow further.")
+SacTab:Label("Default tier = Galactic (dropdown). Only weapons whose OneIn falls in that band are used; status shows inv name vs string sent to TotemConfirm.")
 totemStatusLbl = SacTab:Label("Totem: —")
 local totemLastLbl = SacTab:Label("Totem last: —")
 SacTab:Label("Totem auto safety: waits 30s once when hourly CD reaches 0 to avoid stale re-lock text.")
@@ -2380,14 +2670,14 @@ SacTab:Button("🕯️", "Totem: sacrifice 1 (next in color)", "Cycles all weapo
             no_weapon = "No weapon (enable Totem By color or refresh inv)",
             no_totem_tick = "Tick weapon(s) in the list that pass Totem color — or turn off Totem only ✓ names",
             server_reject = "Server rejected this weapon — skipped 3m; try others (Cobalt name may differ from auto pick)",
-            throttle = "Wait a few seconds between totem calls (anti-spam)",
+            throttle = string.format("Min %.1fs between TotemConfirm calls (wait)", TOTEM_MIN_INVOKE_GAP_SEC),
             fail = "TotemConfirm error (remote missing or InvokeServer threw)",
         })[why] or tostring(why)
         totemLastLbl.Set("Totem last: " .. msg)
         SLbl.Text = "Totem: " .. msg
     end
 end)
-local totemAutoToggle = SacTab:Toggle("Auto Totem", "Every 1.5s: Totem color cap + keep, highest Rank, TotemConfirm — saved", states.autoTotem, function(on)
+local totemAutoToggle = SacTab:Toggle("Auto Totem", "Fast tick + gap between invokes; Totem color tier (default Galactic), keep, Rank sort, TotemConfirm — saved", states.autoTotem, function(on)
     states.autoTotem = on == true
     saveSettings()
     SLbl.Text = on and "Auto Totem ON" or "Auto Totem OFF"
@@ -2543,7 +2833,7 @@ addThread(task.spawn(function()
     while true do
         if GEN ~= _G.MeleeRNG_Gen then break end
         if not states.autoTotem then task.wait(1); continue end
-        task.wait(1.5)
+        task.wait(TOTEM_AUTO_TICK_SEC)
         if not states.totemFilterColor then
             if totemLastLbl then totemLastLbl.Set("Totem auto: turn on Totem: By color (OneIn)") end
             continue
@@ -2692,6 +2982,7 @@ local _perfEffOn = {}   -- [ParticleEmitter|Trail|Beam] = prior Enabled while hi
 local _perfLastEffectsHidden = false
 local _perfFxAcc = 0    -- throttle workspace:GetDescendants() sweeps (~every 5×0.12s)
 local _perfLootLTM = {} -- loot drop parts (separate from weapon LTM map)
+local _perfMobManaLTM = {} -- mob mana pickup models (workspace; MobsClientController Mana template)
 local _perfSoundVol = {} -- [Sound] = prior Volume
 local _perfSoundAcc = 0
 local _perfSavedGlobalShadows = nil -- bool | nil
@@ -2837,6 +3128,53 @@ local function perfRestoreAllLoot()
     perfCleanupStaleLootKeys()
 end
 
+local function perfCleanupStaleMobManaKeys()
+    for p in pairs(_perfMobManaLTM) do
+        if not (p and p.Parent) then _perfMobManaLTM[p] = nil end
+    end
+end
+
+-- MobsClientController clones script.Mana to workspace (Main part + Attachment.Shadow under Main).
+local function isMobManaPickupModel(m)
+    if not m:IsA("Model") then return false end
+    if m.Parent ~= workspace then return false end
+    local main = m:FindFirstChild("Main")
+    if not main or not main:IsA("BasePart") then return false end
+    local att = main:FindFirstChild("Attachment")
+    if att and att:FindFirstChild("Shadow") then
+        return true
+    end
+    return main:FindFirstChild("Shadow") ~= nil
+end
+
+local function perfSweepMobManaOrbs(hide)
+    for _, ch in ipairs(workspace:GetChildren()) do
+        if ch:IsA("Model") and isMobManaPickupModel(ch) then
+            for _, d in ipairs(ch:GetDescendants()) do
+                if d:IsA("BasePart") then
+                    if hide then
+                        if _perfMobManaLTM[d] == nil then
+                            _perfMobManaLTM[d] = d.LocalTransparencyModifier
+                        end
+                        d.LocalTransparencyModifier = 1
+                    else
+                        local prev = _perfMobManaLTM[d]
+                        if prev ~= nil then
+                            d.LocalTransparencyModifier = prev
+                            _perfMobManaLTM[d] = nil
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function perfRestoreMobManaOrbs()
+    perfSweepMobManaOrbs(false)
+    perfCleanupStaleMobManaKeys()
+end
+
 local function perfRestoreAllWorldSounds()
     for snd, vol in pairs(_perfSoundVol) do
         pcall(function()
@@ -2926,9 +3264,10 @@ addThread(task.spawn(function()
         local sw = states.perfHideOwnWeapons
         local ef = states.perfHideAllEffects
         local lo = states.perfHideLootDrops
+        local mm = states.perfHideMobManaOrbs
         local ws = states.perfMuteWorldSounds
         local oc = states.perfHideOtherCharacters
-        if not ow and not sw and not ef and not lo and not ws and not oc then
+        if not ow and not sw and not ef and not lo and not mm and not ws and not oc then
             if _perfLastEffectsHidden then
                 perfRestoreEffects()
                 _perfLastEffectsHidden = false
@@ -2936,6 +3275,7 @@ addThread(task.spawn(function()
             _perfFxAcc = 0
             perfRestoreAllWeaponFolders()
             perfRestoreAllLoot()
+            perfRestoreMobManaOrbs()
             perfSweepOtherCharacters(false)
             perfCleanupStaleCharKeys()
             if _perfLastSoundsMuted then
@@ -2946,7 +3286,11 @@ addThread(task.spawn(function()
             task.wait(0.5)
             continue
         end
-        task.wait(0.12)
+        if ow or sw or mm then
+            RunService.Heartbeat:Wait()
+        else
+            task.wait(0.12)
+        end
         if sw then
             perfSweepWeaponFolder(workspace:FindFirstChild(LP.Name), true)
         else
@@ -2984,6 +3328,12 @@ addThread(task.spawn(function()
             perfSweepLootDrops(false)
         end
         perfCleanupStaleLootKeys()
+        if mm then
+            perfSweepMobManaOrbs(true)
+        else
+            perfSweepMobManaOrbs(false)
+        end
+        perfCleanupStaleMobManaKeys()
         if ws then
             _perfSoundAcc = _perfSoundAcc + 1
             if _perfSoundAcc >= 6 then
@@ -3851,9 +4201,8 @@ addThread(task.spawn(function()
 end))
 
 -- --------------------------------------------------------------------------
--- UI — Stop button + stats row (KPM / ascend ETA / aura line)
+-- Kill rate + ascend ETA helpers (stay in this IIFE — auto farm loop calls getKillRate / getAscendETA)
 -- --------------------------------------------------------------------------
--- ── Kill rate + ascend ETA helpers ─────────────────────────────────────────
 local _killHistory  = {}
 local _KILL_WINDOW  = 60
 local _lastKillCount = 0
@@ -3914,198 +4263,9 @@ addThread(task.spawn(function()
     end
 end))
 
-MiscTab:Section("Stats & Kill Rate")
-local StatsLbl = MiscTab:Label("Kills: — | Mana: — | SP: — | Ascends: —")
-local KPMLbl   = MiscTab:Label("KPM: — | ETA ascend: —")
-local ETALbl   = MiscTab:Label("Ascend: — / — kills —")
-local AuraStatLbl = MiscTab:Label("Aura: equipped — | roll UI —")
-local autoFarmCycleStatusLbl
-
-addThread(task.spawn(function()
-    while true do
-        if GEN ~= _G.MeleeRNG_Gen then break end
-        task.wait(1)
-        local kpm = getKillRate()
-        pcall(function()
-            StatsLbl.Set(string.format("Kills: %s | Mana: %s | SP: %s | Ascends: %s",
-                tostring(getKills()), tostring(getMana()), tostring(getSP()), tostring(getAscends())))
-            if guildStatusLbl and guildStatusLbl.Set then
-                local g = fetchGuildState()
-                if g then
-                    local own = tostring(g.Owner) == tostring(LP.UserId)
-                    guildStatusLbl.Set(string.format(
-                        "Guild: %s | GP: %s | %s",
-                        tostring(g.Name or "?"),
-                        tostring(g.GuildPoints or 0),
-                        own and "owner" or "member"))
-                else
-                    guildStatusLbl.Set("Guild: — (join/create in game)")
-                end
-            end
-            if apStatusLbl and apStatusLbl.Set then
-                local ap = parseAscendPoints(invokeR("GetAscendPoints"))
-                apStatusLbl.Set(string.format("Ascend Points: %s (castle statue upgrades)", tostring(ap)))
-            end
-            local dest, killsNeeded, req = getAscendETA()
-            if req then
-                local etaSecs = (kpm>0 and killsNeeded>0) and (killsNeeded/kpm*60) or nil
-                local etaStr  = etaSecs and fmtTime(etaSecs) or (killsNeeded==0 and "READY" or "—")
-                local destStr = dest and tostring(dest) or "?"
-                KPMLbl.Set(string.format("KPM: %.1f | ETA ascend → %s: %s", kpm, destStr, etaStr))
-                ETALbl.Set(string.format("Ascend: %s / %s kills (%s more) → %s",
-                    tostring(getKills()), tostring(req), tostring(killsNeeded), destStr))
-            else
-                KPMLbl.Set(string.format("KPM: %.1f | Ascend: —", kpm))
-                ETALbl.Set("Ascend: —")
-            end
-            local eqA = getEquippedAuraName()
-            local rollA = getRolledAuraNameFromRollUi()
-            AuraStatLbl.Set(string.format(
-                "Aura: equipped %s | roll UI %s | preferred %s",
-                eqA or "—",
-                rollA or "—",
-                (states.auraPreferredName ~= "" and states.auraPreferredName) or "—"))
-            if autoFarmCycleStatusLbl and autoFarmCycleStatusLbl.Set then
-                if states.autoCycleFarm then
-                    autoFarmCycleStatusLbl.Set(meleeAutoFarmStatus.line)
-                else
-                    autoFarmCycleStatusLbl.Set("🔁 Farm cycle: OFF")
-                end
-            end
-        end)
-    end
-end))
-
-MiscTab:Section("Ascend")
-autoFarmCycleStatusLbl = MiscTab:Label("🔁 Farm cycle: OFF")
-local autoAscendToggle = MiscTab:Toggle("⬆️ Auto Ascend", "When kills ≥ (2 + Ascends) × 1M — ConfirmAscend + saved TP chase. Pair with Auto Farm cycle for full loop; cycle never calls ascend.", states.autoAscend, function(on)
-    states.autoAscend = on == true
-    saveSettings()
-    SLbl.Text = states.autoAscend and "Auto Ascend ON" or "Auto Ascend OFF"
-end)
-MiscTab:Label(
-    "Notes — Auto Ascend: runs in its own loop. When kills ≥ (2 + Ascends) × 1M, it InvokeServer(ConfirmAscend) if your area has NextPortal, then runs the saved post-ascend TP chase (same as Ascend Now on success). Works while Auto Farm cycle is ON.")
-MiscTab:Label(
-    "Notes — together: Auto Farm cycle never calls ConfirmAscend. After the cycle reaches the kill gate it waits until your Ascends stat increases, then runs the TP chase and starts the next loop. For hands-off play, turn Auto Farm cycle ON and Auto Ascend ON.")
-local autoCycleFarmToggle = MiscTab:Toggle(
-    "🔁 Auto Farm cycle",
-    "TP → upgrades/raid if needed → raid off → farm to ascend kills → wait for ascend (use ⬆️ Auto Ascend ON for auto).",
-    states.autoCycleFarm,
-    function(on)
-        states.autoCycleFarm = on == true
-        if not on then
-            meleeAutoFarmStatus.raidPhaseActive = false
-            meleeAutoFarmStatus.farmPhaseActive = false
-        end
-        saveSettings()
-        SLbl.Text = on and "Auto Farm cycle ON" or "Auto Farm cycle OFF"
-        meleeAutoFarmStatus.line = on and "🔁 Farm cycle: ON (waiting tick…)" or "🔁 Farm cycle: OFF"
-        pcall(function()
-            if autoFarmCycleStatusLbl and autoFarmCycleStatusLbl.Set then
-                autoFarmCycleStatusLbl.Set(meleeAutoFarmStatus.line)
-            end
-        end)
-    end
-)
-
-MiscTab:Label("Notes — Auto Farm cycle (order of operations)")
-MiscTab:Label(
-    "Step 1 — Teleport to saved Ascend TP (below: Set Ascend TP Here). Each full loop begins with this TP.")
-MiscTab:Label(
-    "Step 2 — Evaluate upgrades: Upgrades-tab rows that are ON with a numeric cap must reach that cap; rows ON without a cap buy until the auto-buy queue is empty. If nothing needs raid SP, the raid step is skipped.")
-MiscTab:Label(
-    "Step 3 — Raid + upgrades (only if step 2 needs spend): if Auto Raid shows OFF, the script turns it ON (firesignal AutoRaidBtn). Auto Upgrade is forced ON until step 2 is satisfied, then Auto Raid is turned OFF if it still shows ON.")
-MiscTab:Label(
-    "Step 4 — Farm at the saved TP until kills ≥ (2 + current Ascends) × 1 million (same formula as ⬆️ Auto Ascend).")
-MiscTab:Label(
-    "Step 5 — Ascend is not done by the cycle. Leave ⬆️ Auto Ascend ON to call ConfirmAscend when the game allows (NextPortal in current area, server accepts). Or use Ascend Now / the game UI. The cycle detects when Ascends goes up, runs post-ascend TP to the saved spot, then goes back to Step 1.")
-MiscTab:Label(
-    "Raid line “X/Y below cap”: X = ON+cap rows still under cap; Y = how many ON+cap rows exist. If Y = 0 you see “caps —”; the raid step then ends only when the buy queue is empty.")
-MiscTab:Label(
-    "Tips: use “Show Auto Raid Button” in Misc if OptionsList hides the button. Raid step can run up to ~45 minutes then time out if SP, caps, or queue block progress. If only the cycle is ON at the kill gate, you stay on “waiting for ascend” until you ascend manually or enable Auto Ascend.")
-
-task.defer(function()
-    pcall(function()
-        if autoAscendToggle and autoAscendToggle.Set then
-            autoAscendToggle.Set(states.autoAscend)
-        end
-        if autoCycleFarmToggle and autoCycleFarmToggle.Set then
-            autoCycleFarmToggle.Set(states.autoCycleFarm)
-        end
-    end)
-end)
-
-MiscTab:Label("Post-ascend teleport: stand where you want, tap Set — used by ⬆️ Auto Ascend, Ascend Now, and the farm cycle after it sees Ascends increase.")
-local ascendTpLbl = MiscTab:Label("")
-local function refreshAscendTpLbl()
-    ascendTpLbl.Set("Saved TP (+3 studs Y): " .. formatAscendTpSaved())
-end
-refreshAscendTpLbl()
-
-local ascendAuraKeepToggle = MiscTab:Toggle("✨ Keep aura before Ascend TP", "Waits for AuraRollUI, fires KEEP (ConfirmBtn), then chases saved TP. Off = TP immediately after ascend. Needs firesignal/getconnections or falls back to UI cleanup.", states.ascendAuraKeepBeforeTp, function(on)
-    states.ascendAuraKeepBeforeTp = on == true
-    saveSettings()
-    SLbl.Text = on and "Ascend: keep aura before TP ON" or "Ascend: keep aura before TP OFF"
-end)
-task.defer(function()
-    pcall(function()
-        if ascendAuraKeepToggle and ascendAuraKeepToggle.Set then
-            ascendAuraKeepToggle.Set(states.ascendAuraKeepBeforeTp)
-        end
-    end)
-end)
-
-MiscTab:Button("📍", "Set Ascend TP Here", "Saves HumanoidRootPart position as after-ascend teleport target", C.green, function()
-    local root = getRoot()
-    if not root then SLbl.Text = "⚠ No character"; return end
-    local p = root.Position
-    states.ascendAfterTpX = p.X
-    states.ascendAfterTpY = p.Y
-    states.ascendAfterTpZ = p.Z
-    saveSettings()
-    refreshAscendTpLbl()
-    SLbl.Text = "✓ Ascend TP saved — " .. formatAscendTpSaved()
-end)
-MiscTab:Button("↩", "Reset Ascend TP to Default", "Forgotten Valley coords (496.9, 222.1, -7380.4)", C.sub, function()
-    states.ascendAfterTpX = DEF_ASCEND_TP_X
-    states.ascendAfterTpY = DEF_ASCEND_TP_Y
-    states.ascendAfterTpZ = DEF_ASCEND_TP_Z
-    saveSettings()
-    refreshAscendTpLbl()
-    SLbl.Text = "✓ Ascend TP reset to default"
-end)
-
-MiscTab:Button("⬆️", "Ascend Now", "ConfirmAscend — then TP only if Ascends stat increases", C.gold, function()
-    local beforeA = tonumber(getAscends()) or 0
-    local ok = invokeR("ConfirmAscend")
-    if not ok then
-        SLbl.Text = "⚠ Not ready (kill requirement not met)"
-        return
-    end
-    if teleportAfterAscendIfConfirmed(beforeA) then
-        SLbl.Text = "✓ Ascended — TP " .. formatAscendTpSaved()
-    else
-        SLbl.Text = "⚠ Ascends unchanged — no TP (server did not apply ascend?)"
-    end
-end)
-MiscTab:Button("🎯", "Check Ascend Status", "Shows (2+Ascends)×1M kill gate vs your kills + next portal", C.accent, function()
-    local req = getAscendKillsRequired()
-    local have = tonumber(getKills()) or 0
-    local more = math.max(0, req - have)
-    local dest = nil
-    pcall(function()
-        local area = invokeR("GetArea")
-        if not area then return end
-        local np = area:FindFirstChild("NextPortal")
-        if not np then return end
-        dest = np:GetAttribute("Destination")
-    end)
-    SLbl.Text = string.format(
-        "Ascend: %s / %s kills (%s more) | ascends=%s | next → %s",
-        tostring(have), tostring(req), tostring(more), tostring(getAscends()),         tostring(dest or "?"))
-end)
-
-meleeGuiMountMiscAuraSection(MiscTab, SLbl, C)
+local miscAscendGui = meleeGuiMountMiscStatsLabelsAscendAura(MiscTab, SLbl, C, function()
+    return guildStatusLbl, apStatusLbl
+end, getKillRate, getAscendETA, fmtTime)
 
 -- `;` required before `(` here: otherwise Luau parses `(function` as a call on task.defer's return value.
 ;(function()
@@ -4148,6 +4308,53 @@ meleeGuiMountMiscAuraSection(MiscTab, SLbl, C)
         SLbl.Text = on and "✓ HideMobsBtn shown" or "HideMobsBtn hidden"
     end)
 
+    MiscTab:Label("Hide main-game UI (local only; Heartbeat reapplies while any hide is on — avoids fighting roll UI).")
+    MiscTab:Toggle("🙈 Hide Mana / Kills", "Hides ManaFrame, KillsFrame, StageProgress (combat kill bar) — saved", states.uiHideManaKills, function(on)
+        states.uiHideManaKills = on == true
+        saveSettings()
+        applyMeleeGameUiHiding(true)
+        SLbl.Text = on and "Game UI: Mana/Kills hidden" or "Game UI: Mana/Kills visible"
+    end)
+    MiscTab:Toggle("🎰 Hide Mini-Roll Animations", "Hides MainGUI.GeneralUI.MiniRollFrame — saved", states.uiHideMiniRoll, function(on)
+        states.uiHideMiniRoll = on == true
+        saveSettings()
+        applyMeleeGameUiHiding(true)
+        SLbl.Text = on and "Game UI: Mini-Roll hidden" or "Game UI: Mini-Roll visible"
+    end)
+    MiscTab:Toggle("📵 Hide HUD", "Hides all of MainGUI.GeneralUI (includes mana/kills/mini-roll while ON) — saved", states.uiHideHud, function(on)
+        states.uiHideHud = on == true
+        saveSettings()
+        if on ~= true then
+            pcall(function()
+                local main = LP.PlayerGui:FindFirstChild("MainGUI")
+                local gen = main and main:FindFirstChild("GeneralUI")
+                if gen and gen:IsA("GuiObject") then
+                    gen.Visible = true
+                end
+            end)
+        end
+        applyMeleeGameUiHiding(true)
+        SLbl.Text = on and "Game UI: GeneralUI (HUD) hidden" or "Game UI: GeneralUI (HUD) visible"
+    end)
+    MiscTab:Toggle("🔕 Hide game notifications", "Hides MainGUI.NotifFrame (SP wins, sacrifice, limits, etc.) — local only — saved", states.uiHideNotifications, function(on)
+        states.uiHideNotifications = on == true
+        saveSettings()
+        if on ~= true then
+            pcall(function()
+                local main = LP.PlayerGui:FindFirstChild("MainGUI")
+                local nf = main and main:FindFirstChild("NotifFrame")
+                if nf and nf:IsA("GuiObject") then
+                    nf.Visible = true
+                end
+            end)
+        end
+        applyMeleeGameUiHiding(true)
+        SLbl.Text = on and "Game UI: notifications hidden" or "Game UI: notifications visible"
+    end)
+    task.defer(function()
+        pcall(function() applyMeleeGameUiHiding(true) end)
+    end)
+
     MiscTab:Section("Performance")
     MiscTab:Label("Client-only FPS helpers. Does not change server / combat hitboxes.")
     local perfUi = {}
@@ -4176,6 +4383,12 @@ meleeGuiMountMiscAuraSection(MiscTab, SLbl, C)
         saveSettings()
         if on == true then pcall(function() perfSweepLootDrops(true) end) end
         SLbl.Text = on and "Perf: loot hidden" or "Perf: loot visible"
+    end)
+    perfUi.mobmana = MiscTab:Toggle("Hide mob mana orbs", "Hides pink mana pickups spawned in workspace (not weapon loot — client-only) — saved", states.perfHideMobManaOrbs, function(on)
+        states.perfHideMobManaOrbs = on == true
+        saveSettings()
+        if on == true then pcall(function() perfSweepMobManaOrbs(true) end) end
+        SLbl.Text = on and "Perf: mob mana orbs hidden" or "Perf: mob mana orbs visible"
     end)
     perfUi.sound = MiscTab:Toggle("Mute World Sounds", "Sets workspace Sound.Volume to 0 (restores when off). Throttled rescans for new sounds — saved", states.perfMuteWorldSounds, function(on)
         states.perfMuteWorldSounds = on == true
@@ -4218,6 +4431,7 @@ meleeGuiMountMiscAuraSection(MiscTab, SLbl, C)
             if p.own and p.own.Set then p.own.Set(states.perfHideOwnWeapons) end
             if p.fx and p.fx.Set then p.fx.Set(states.perfHideAllEffects) end
             if p.loot and p.loot.Set then p.loot.Set(states.perfHideLootDrops) end
+            if p.mobmana and p.mobmana.Set then p.mobmana.Set(states.perfHideMobManaOrbs) end
             if p.sound and p.sound.Set then p.sound.Set(states.perfMuteWorldSounds) end
             if p.shadow and p.shadow.Set then p.shadow.Set(states.perfDisableShadows) end
             if p.tech and p.tech.Set then p.tech.Set(states.perfCompatLighting) end
@@ -4232,6 +4446,7 @@ meleeGuiMountMiscAuraSection(MiscTab, SLbl, C)
                 _perfSoundAcc = 0
             end
             if states.perfHideLootDrops then pcall(function() perfSweepLootDrops(true) end) end
+            if states.perfHideMobManaOrbs then pcall(function() perfSweepMobManaOrbs(true) end) end
             if states.perfHideAllEffects then
                 pcall(perfSweepEffectsHide)
                 _perfLastEffectsHidden = true
@@ -4318,8 +4533,9 @@ MiscTab:Button("🛑", "Stop All Loops", "Disconnects all connections and cancel
     meleeAutoFarmStatus.farmPhaseActive = false
     meleeAutoFarmStatus.line = "🔁 Farm cycle: OFF (Stop All)"
     pcall(function()
-        if autoFarmCycleStatusLbl and autoFarmCycleStatusLbl.Set then
-            autoFarmCycleStatusLbl.Set(meleeAutoFarmStatus.line)
+        local fc = miscAscendGui and miscAscendGui.autoFarmCycleStatusLbl
+        if fc and fc.Set then
+            fc.Set(meleeAutoFarmStatus.line)
         end
     end)
     states.autoSacrifice = false
@@ -4348,10 +4564,12 @@ MiscTab:Button("🛑", "Stop All Loops", "Disconnects all connections and cancel
         if apAutoToggle and apAutoToggle.Set then apAutoToggle.Set(false) end
     end)
     pcall(function()
-        if autoCycleFarmToggle and autoCycleFarmToggle.Set then autoCycleFarmToggle.Set(false) end
+        local g = miscAscendGui
+        if g and g.autoCycleFarmToggle and g.autoCycleFarmToggle.Set then g.autoCycleFarmToggle.Set(false) end
     end)
     pcall(function()
-        if autoAscendToggle and autoAscendToggle.Set then autoAscendToggle.Set(false) end
+        local g = miscAscendGui
+        if g and g.autoAscendToggle and g.autoAscendToggle.Set then g.autoAscendToggle.Set(false) end
     end)
     pcall(function()
         if autoEquipBestToggle and autoEquipBestToggle.Set then autoEquipBestToggle.Set(false) end
