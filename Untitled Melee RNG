@@ -393,6 +393,7 @@ local states = {
     perfDisableShadows   = false, -- Lighting.GlobalShadows
     perfHideLootDrops    = false, -- workspace.Loot (dump LootController)
     perfHideMobManaOrbs  = false, -- MobsClientController: script.Mana → workspace (pink pickup; not under Loot)
+    perfHideHitboxVisuals = false, -- parts named Hitbox under workspace[you] weapons (white range rings); skip if Hide Own Weapons on
     perfMuteWorldSounds  = false, -- Sound instances under workspace
     perfCompatLighting   = false, -- Lighting.Technology → Compatibility
     perfLowGraphicsQuality = false, -- UserGameSettings quality (executor/client dependent)
@@ -576,6 +577,7 @@ states.perfHideAllEffects = states.perfHideAllEffects == true
 states.perfDisableShadows = states.perfDisableShadows == true
 states.perfHideLootDrops = states.perfHideLootDrops == true
 states.perfHideMobManaOrbs = states.perfHideMobManaOrbs == true
+states.perfHideHitboxVisuals = states.perfHideHitboxVisuals == true
 states.perfMuteWorldSounds = states.perfMuteWorldSounds == true
 states.perfCompatLighting = states.perfCompatLighting == true
 states.perfLowGraphicsQuality = states.perfLowGraphicsQuality == true
@@ -1397,6 +1399,77 @@ local function meleeGuiMountApTab(ApTab, SLbl, C)
         apUpgradeToggles = apUpgradeToggles,
     }
 end
+
+-- KPM / ETA helpers in their own closure (main UI IIFE was exceeding Luau’s ~200 local registers on fmtTime).
+local function meleeKillRateModule()
+    local _killHistory  = {}
+    local _KILL_WINDOW  = 60
+    local _lastKillCount = 0
+
+    local function recordKills()
+        local now   = os.clock()
+        local kills = getKills()
+        if kills ~= _lastKillCount then
+            _lastKillCount = kills
+            _killHistory[#_killHistory+1] = {t=now, k=kills}
+        end
+        local cutoff = now - _KILL_WINDOW
+        local i = 1
+        while i <= #_killHistory and _killHistory[i].t < cutoff do i = i+1 end
+        if i > 1 then
+            for j = 1, #_killHistory-i+1 do _killHistory[j] = _killHistory[j+i-1] end
+            for j = #_killHistory-i+2, #_killHistory do _killHistory[j] = nil end
+        end
+    end
+
+    local function getKillRate()
+        if #_killHistory < 2 then return 0 end
+        local oldest = _killHistory[1]; local newest = _killHistory[#_killHistory]
+        local dt = newest.t - oldest.t
+        if dt < 1 then return 0 end
+        return (newest.k - oldest.k) / dt * 60
+    end
+
+    local function fmtTime(secs)
+        if secs <= 0 or secs ~= secs then return "—" end
+        if secs > 86400*30 then return ">30 days" end
+        local d=math.floor(secs/86400); local h=math.floor((secs%86400)/3600)
+        local m=math.floor((secs%3600)/60); local s=math.floor(secs%60)
+        if d>0 then return string.format("%dd %dh %dm",d,h,m) end
+        if h>0 then return string.format("%dh %dm %ds",h,m,s) end
+        if m>0 then return string.format("%dm %ds",m,s) end
+        return string.format("%ds",s)
+    end
+
+    local function getAscendETA()
+        local req = getAscendKillsRequired()
+        local killsNeeded = math.max(0, req - (tonumber(getKills()) or 0))
+        local dest
+        pcall(function()
+            local area = invokeR("GetArea"); if not area then return end
+            local np = area:FindFirstChild("NextPortal"); if not np then return end
+            dest = np:GetAttribute("Destination")
+        end)
+        return dest, killsNeeded, req
+    end
+
+    return {
+        recordKills = recordKills,
+        getKillRate = getKillRate,
+        fmtTime = fmtTime,
+        getAscendETA = getAscendETA,
+    }
+end
+
+local KR = meleeKillRateModule()
+
+addThread(task.spawn(function()
+    while true do
+        if GEN ~= _G.MeleeRNG_Gen then break end
+        KR.recordKills()
+        task.wait(0.5)
+    end
+end))
 
 -- Luau ~200 locals: window UI + return SLbl live in this IIFE; heavy Misc blocks use meleeGuiMountMisc* helpers (Stats+Ascend+Aura is its own function); re-exec init stays outside below.
 local SLbl = (function()
@@ -2983,6 +3056,8 @@ local _perfLastEffectsHidden = false
 local _perfFxAcc = 0    -- throttle workspace:GetDescendants() sweeps (~every 5×0.12s)
 local _perfLootLTM = {} -- loot drop parts (separate from weapon LTM map)
 local _perfMobManaLTM = {} -- mob mana pickup models (workspace; MobsClientController Mana template)
+local _perfMobManaFx = {} -- ParticleEmitter|Trail|Beam etc. under mana models — prior Enabled
+local _perfHitboxVisLTM = {} -- Hitbox BaseParts under your weapon folder — prior LocalTransparencyModifier
 local _perfSoundVol = {} -- [Sound] = prior Volume
 local _perfSoundAcc = 0
 local _perfSavedGlobalShadows = nil -- bool | nil
@@ -3132,19 +3207,46 @@ local function perfCleanupStaleMobManaKeys()
     for p in pairs(_perfMobManaLTM) do
         if not (p and p.Parent) then _perfMobManaLTM[p] = nil end
     end
+    for inst in pairs(_perfMobManaFx) do
+        if not (inst and inst.Parent) then _perfMobManaFx[inst] = nil end
+    end
 end
 
--- MobsClientController clones script.Mana to workspace (Main part + Attachment.Shadow under Main).
+local function perfCleanupStaleHitboxVisKeys()
+    for p in pairs(_perfHitboxVisLTM) do
+        if not (p and p.Parent) then _perfHitboxVisLTM[p] = nil end
+    end
+end
+
+-- MobsClientController clones script.Mana to workspace (Main part + Attachment.Shadow / Trail under Main).
 local function isMobManaPickupModel(m)
     if not m:IsA("Model") then return false end
     if m.Parent ~= workspace then return false end
     local main = m:FindFirstChild("Main")
     if not main or not main:IsA("BasePart") then return false end
+    if m.Name == "Mana" then
+        return true
+    end
     local att = main:FindFirstChild("Attachment")
     if att and att:FindFirstChild("Shadow") then
         return true
     end
     return main:FindFirstChild("Shadow") ~= nil
+end
+
+local function perfMobManaFxDisable(inst, hide)
+    if hide then
+        if _perfMobManaFx[inst] == nil then
+            _perfMobManaFx[inst] = inst.Enabled
+        end
+        inst.Enabled = false
+    else
+        local was = _perfMobManaFx[inst]
+        if was ~= nil then
+            pcall(function() inst.Enabled = was end)
+            _perfMobManaFx[inst] = nil
+        end
+    end
 end
 
 local function perfSweepMobManaOrbs(hide)
@@ -3164,6 +3266,9 @@ local function perfSweepMobManaOrbs(hide)
                             _perfMobManaLTM[d] = nil
                         end
                     end
+                elseif d:IsA("ParticleEmitter") or d:IsA("Trail") or d:IsA("Beam")
+                    or d:IsA("Fire") or d:IsA("Smoke") or d:IsA("Sparkles") then
+                    perfMobManaFxDisable(d, hide)
                 end
             end
         end
@@ -3173,6 +3278,37 @@ end
 local function perfRestoreMobManaOrbs()
     perfSweepMobManaOrbs(false)
     perfCleanupStaleMobManaKeys()
+end
+
+-- White “rings” / range visuals: weapon models use a BasePart named Hitbox (still needs Touched — only hide rendering).
+local function perfSweepHitboxVisuals(hide)
+    local folder = workspace:FindFirstChild(LP.Name)
+    if not folder then return end
+    for _, weapon in ipairs(folder:GetChildren()) do
+        if weapon:IsA("Model") then
+            for _, d in ipairs(weapon:GetDescendants()) do
+                if d:IsA("BasePart") and d.Name == "Hitbox" then
+                    if hide then
+                        if _perfHitboxVisLTM[d] == nil then
+                            _perfHitboxVisLTM[d] = d.LocalTransparencyModifier
+                        end
+                        d.LocalTransparencyModifier = 1
+                    else
+                        local prev = _perfHitboxVisLTM[d]
+                        if prev ~= nil then
+                            d.LocalTransparencyModifier = prev
+                            _perfHitboxVisLTM[d] = nil
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function perfRestoreHitboxVisuals()
+    perfSweepHitboxVisuals(false)
+    perfCleanupStaleHitboxVisKeys()
 end
 
 local function perfRestoreAllWorldSounds()
@@ -3265,9 +3401,10 @@ addThread(task.spawn(function()
         local ef = states.perfHideAllEffects
         local lo = states.perfHideLootDrops
         local mm = states.perfHideMobManaOrbs
+        local hv = states.perfHideHitboxVisuals
         local ws = states.perfMuteWorldSounds
         local oc = states.perfHideOtherCharacters
-        if not ow and not sw and not ef and not lo and not mm and not ws and not oc then
+        if not ow and not sw and not ef and not lo and not mm and not hv and not ws and not oc then
             if _perfLastEffectsHidden then
                 perfRestoreEffects()
                 _perfLastEffectsHidden = false
@@ -3276,6 +3413,7 @@ addThread(task.spawn(function()
             perfRestoreAllWeaponFolders()
             perfRestoreAllLoot()
             perfRestoreMobManaOrbs()
+            perfRestoreHitboxVisuals()
             perfSweepOtherCharacters(false)
             perfCleanupStaleCharKeys()
             if _perfLastSoundsMuted then
@@ -3286,7 +3424,7 @@ addThread(task.spawn(function()
             task.wait(0.5)
             continue
         end
-        if ow or sw or mm then
+        if ow or sw or mm or (hv and not sw) then
             RunService.Heartbeat:Wait()
         else
             task.wait(0.12)
@@ -3334,6 +3472,12 @@ addThread(task.spawn(function()
             perfSweepMobManaOrbs(false)
         end
         perfCleanupStaleMobManaKeys()
+        if hv and not sw then
+            perfSweepHitboxVisuals(true)
+        else
+            perfSweepHitboxVisuals(false)
+        end
+        perfCleanupStaleHitboxVisKeys()
         if ws then
             _perfSoundAcc = _perfSoundAcc + 1
             if _perfSoundAcc >= 6 then
@@ -4142,8 +4286,8 @@ addThread(task.spawn(function()
             while states.autoCycleFarm and GEN == _G.MeleeRNG_Gen do
                 local k = tonumber(getKills()) or 0
                 local req = getAscendKillsRequired()
-                local dest, killsNeeded = getAscendETA()
-                local kpm = getKillRate()
+                local dest, killsNeeded = KR.getAscendETA()
+                local kpm = KR.getKillRate()
                 meleeAutoFarmStatus.line = string.format(
                     "🔁 Farm | %s / %s kills (%s left) → %s | ~%.1f KPM",
                     tostring(k),
@@ -4200,72 +4344,9 @@ addThread(task.spawn(function()
     end
 end))
 
--- --------------------------------------------------------------------------
--- Kill rate + ascend ETA helpers (stay in this IIFE — auto farm loop calls getKillRate / getAscendETA)
--- --------------------------------------------------------------------------
-local _killHistory  = {}
-local _KILL_WINDOW  = 60
-local _lastKillCount = 0
-
-local function recordKills()
-    local now   = os.clock()
-    local kills = getKills()
-    if kills ~= _lastKillCount then
-        _lastKillCount = kills
-        _killHistory[#_killHistory+1] = {t=now, k=kills}
-    end
-    local cutoff = now - _KILL_WINDOW
-    local i = 1
-    while i <= #_killHistory and _killHistory[i].t < cutoff do i = i+1 end
-    if i > 1 then
-        for j = 1, #_killHistory-i+1 do _killHistory[j] = _killHistory[j+i-1] end
-        for j = #_killHistory-i+2, #_killHistory do _killHistory[j] = nil end
-    end
-end
-
-local function getKillRate()
-    if #_killHistory < 2 then return 0 end
-    local oldest = _killHistory[1]; local newest = _killHistory[#_killHistory]
-    local dt = newest.t - oldest.t
-    if dt < 1 then return 0 end
-    return (newest.k - oldest.k) / dt * 60
-end
-
-local function fmtTime(secs)
-    if secs <= 0 or secs ~= secs then return "—" end
-    if secs > 86400*30 then return ">30 days" end
-    local d=math.floor(secs/86400); local h=math.floor((secs%86400)/3600)
-    local m=math.floor((secs%3600)/60); local s=math.floor(secs%60)
-    if d>0 then return string.format("%dd %dh %dm",d,h,m) end
-    if h>0 then return string.format("%dh %dm %ds",h,m,s) end
-    if m>0 then return string.format("%dm %ds",m,s) end
-    return string.format("%ds",s)
-end
-
--- next portal name (or nil), kills short of req, total kills required = (2+ascends)×1M
-local function getAscendETA()
-    local req = getAscendKillsRequired()
-    local killsNeeded = math.max(0, req - (tonumber(getKills()) or 0))
-    local dest
-    pcall(function()
-        local area = invokeR("GetArea"); if not area then return end
-        local np = area:FindFirstChild("NextPortal"); if not np then return end
-        dest = np:GetAttribute("Destination")
-    end)
-    return dest, killsNeeded, req
-end
-
-addThread(task.spawn(function()
-    while true do
-        if GEN ~= _G.MeleeRNG_Gen then break end
-        recordKills()
-        task.wait(0.5)
-    end
-end))
-
 local miscAscendGui = meleeGuiMountMiscStatsLabelsAscendAura(MiscTab, SLbl, C, function()
     return guildStatusLbl, apStatusLbl
-end, getKillRate, getAscendETA, fmtTime)
+end, KR.getKillRate, KR.getAscendETA, KR.fmtTime)
 
 -- `;` required before `(` here: otherwise Luau parses `(function` as a call on task.defer's return value.
 ;(function()
@@ -4384,11 +4465,17 @@ end, getKillRate, getAscendETA, fmtTime)
         if on == true then pcall(function() perfSweepLootDrops(true) end) end
         SLbl.Text = on and "Perf: loot hidden" or "Perf: loot visible"
     end)
-    perfUi.mobmana = MiscTab:Toggle("Hide mob mana orbs", "Hides pink mana pickups spawned in workspace (not weapon loot — client-only) — saved", states.perfHideMobManaOrbs, function(on)
+    perfUi.mobmana = MiscTab:Toggle("Hide mob mana orbs", "Hides pink mana pickups in workspace + their Trail/Beam/particles (purple streaks). Not weapon loot — client-only — saved", states.perfHideMobManaOrbs, function(on)
         states.perfHideMobManaOrbs = on == true
         saveSettings()
         if on == true then pcall(function() perfSweepMobManaOrbs(true) end) end
         SLbl.Text = on and "Perf: mob mana orbs hidden" or "Perf: mob mana orbs visible"
+    end)
+    perfUi.hitbox = MiscTab:Toggle("Hide Hitbox visuals", "LocalTransparencyModifier on parts named Hitbox under your weapon folder (stops white range rings; Touched unchanged). Off if “Hide Own Weapons” is on — saved", states.perfHideHitboxVisuals, function(on)
+        states.perfHideHitboxVisuals = on == true
+        saveSettings()
+        if on == true and not states.perfHideOwnWeapons then pcall(function() perfSweepHitboxVisuals(true) end) end
+        SLbl.Text = on and "Perf: Hitbox parts hidden" or "Perf: Hitbox visuals restored"
     end)
     perfUi.sound = MiscTab:Toggle("Mute World Sounds", "Sets workspace Sound.Volume to 0 (restores when off). Throttled rescans for new sounds — saved", states.perfMuteWorldSounds, function(on)
         states.perfMuteWorldSounds = on == true
@@ -4432,6 +4519,7 @@ end, getKillRate, getAscendETA, fmtTime)
             if p.fx and p.fx.Set then p.fx.Set(states.perfHideAllEffects) end
             if p.loot and p.loot.Set then p.loot.Set(states.perfHideLootDrops) end
             if p.mobmana and p.mobmana.Set then p.mobmana.Set(states.perfHideMobManaOrbs) end
+            if p.hitbox and p.hitbox.Set then p.hitbox.Set(states.perfHideHitboxVisuals) end
             if p.sound and p.sound.Set then p.sound.Set(states.perfMuteWorldSounds) end
             if p.shadow and p.shadow.Set then p.shadow.Set(states.perfDisableShadows) end
             if p.tech and p.tech.Set then p.tech.Set(states.perfCompatLighting) end
@@ -4447,6 +4535,7 @@ end, getKillRate, getAscendETA, fmtTime)
             end
             if states.perfHideLootDrops then pcall(function() perfSweepLootDrops(true) end) end
             if states.perfHideMobManaOrbs then pcall(function() perfSweepMobManaOrbs(true) end) end
+            if states.perfHideHitboxVisuals and not states.perfHideOwnWeapons then pcall(function() perfSweepHitboxVisuals(true) end) end
             if states.perfHideAllEffects then
                 pcall(perfSweepEffectsHide)
                 _perfLastEffectsHidden = true
