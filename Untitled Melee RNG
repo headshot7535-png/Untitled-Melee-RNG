@@ -429,6 +429,7 @@ local walkSpeedVal   = 16
 local hitboxSize     = 500
 local flyBV, flyBG
 local espBillboards  = {}
+local _hitboxCacheDirty = true
 
 -- ── Settings persistence ──────────────────────────────────────
 local SETTINGS_FILE = "meleernq_settings.json"
@@ -1470,6 +1471,251 @@ addThread(task.spawn(function()
         task.wait(0.5)
     end
 end))
+
+-- Noclip / GodMode / Fly / FullBright / WalkSpeed / ESP / CharacterAdded — own scope (Luau ~200 local cap).
+local function meleeInitMovementEspCharAdded()
+    local noclipParts, noclipConns = {}, {}
+    local function clearNoclipConns()
+        for _, c in ipairs(noclipConns) do pcall(function() c:Disconnect() end) end
+        noclipConns = {}
+    end
+    local function rebuildNoclipParts(char)
+        table.clear(noclipParts); clearNoclipConns()
+        if not char then return end
+        for _, d in ipairs(char:GetDescendants()) do
+            if d:IsA("BasePart") then noclipParts[#noclipParts+1] = d end
+        end
+        noclipConns[#noclipConns+1] = char.DescendantAdded:Connect(function(d)
+            if d:IsA("BasePart") then noclipParts[#noclipParts+1] = d end
+        end)
+    end
+    rebuildNoclipParts(getChar())
+
+    local _lastNoclipPrune = 0
+    addConn(RunService.Stepped:Connect(function()
+        if GEN ~= _G.MeleeRNG_Gen then return end
+        if not states.noclip then return end
+        local now = os.clock()
+        if now - _lastNoclipPrune > 5 then
+            _lastNoclipPrune = now
+            for i=#noclipParts,1,-1 do
+                if not (noclipParts[i] and noclipParts[i].Parent) then
+                    table.remove(noclipParts, i)
+                end
+            end
+        end
+        for _, p in ipairs(noclipParts) do
+            if p and p.Parent then p.CanCollide = false end
+        end
+    end))
+
+    local _lastGod = 0
+    addConn(RunService.Heartbeat:Connect(function()
+        if GEN ~= _G.MeleeRNG_Gen then return end
+        if not states.godMode then return end
+        local now = os.clock(); if now - _lastGod < 0.5 then return end
+        _lastGod = now
+        local h = getHuman()
+        if h then
+            if h.MaxHealth ~= math.huge then h.MaxHealth = math.huge end
+            if h.Health    ~= math.huge then h.Health    = math.huge end
+        end
+    end))
+
+    addConn(RunService.Heartbeat:Connect(function()
+        if GEN ~= _G.MeleeRNG_Gen then return end
+        if states.fly then
+            local root = getRoot(); if not root then return end
+            if not flyBV then
+                flyBV = Instance.new("BodyVelocity", root)
+                flyBV.MaxForce = Vector3.new(1e5,1e5,1e5); flyBV.Velocity = Vector3.zero
+            end
+            if not flyBG then
+                flyBG = Instance.new("BodyGyro", root)
+                flyBG.MaxTorque = Vector3.new(1e5,1e5,1e5); flyBG.D = 100
+            end
+            local cam = workspace.CurrentCamera; local spd = 60; local mv = Vector3.zero
+            if UserInputService:IsKeyDown(Enum.KeyCode.W) then mv = mv + cam.CFrame.LookVector  end
+            if UserInputService:IsKeyDown(Enum.KeyCode.S) then mv = mv - cam.CFrame.LookVector  end
+            if UserInputService:IsKeyDown(Enum.KeyCode.A) then mv = mv - cam.CFrame.RightVector end
+            if UserInputService:IsKeyDown(Enum.KeyCode.D) then mv = mv + cam.CFrame.RightVector end
+            if UserInputService:IsKeyDown(Enum.KeyCode.E) then mv = mv + Vector3.new(0,1,0) end
+            if UserInputService:IsKeyDown(Enum.KeyCode.Q) then mv = mv - Vector3.new(0,1,0) end
+            if mv.Magnitude > 0 then mv = mv.Unit end
+            flyBV.Velocity = mv * spd; flyBG.CFrame = cam.CFrame
+            local h = getHuman(); if h then h:ChangeState(Enum.HumanoidStateType.Physics) end
+        else
+            if flyBV then flyBV:Destroy(); flyBV = nil end
+            if flyBG then flyBG:Destroy(); flyBG = nil end
+        end
+    end))
+
+    local _fb = {
+        applied = false,
+        orig = {
+            Ambient = Lighting.Ambient, OutdoorAmbient = Lighting.OutdoorAmbient,
+            Brightness = Lighting.Brightness, FogEnd = Lighting.FogEnd, FogStart = Lighting.FogStart,
+        }
+    }
+    addConn(RunService.Heartbeat:Connect(function()
+        if GEN ~= _G.MeleeRNG_Gen then return end
+        if states.fullBright then
+            if _fb.applied then return end; _fb.applied = true
+            Lighting.Ambient = Color3.fromRGB(255,255,255)
+            Lighting.OutdoorAmbient = Color3.fromRGB(255,255,255)
+            Lighting.Brightness = 10; Lighting.FogEnd = 1e6; Lighting.FogStart = 1e6
+        elseif _fb.applied then
+            _fb.applied = false
+            Lighting.Ambient = _fb.orig.Ambient; Lighting.OutdoorAmbient = _fb.orig.OutdoorAmbient
+            Lighting.Brightness = _fb.orig.Brightness
+            Lighting.FogEnd = _fb.orig.FogEnd; Lighting.FogStart = _fb.orig.FogStart
+        end
+    end))
+
+    local _speedConn = nil
+    local function enforceSpeed()
+        local h = getHuman(); if not h then return end
+        h.WalkSpeed = walkSpeedVal
+        if _speedConn then _speedConn:Disconnect() end
+        _speedConn = h:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+            if GEN ~= _G.MeleeRNG_Gen then if _speedConn then _speedConn:Disconnect() end return end
+            if h.WalkSpeed ~= walkSpeedVal then h.WalkSpeed = walkSpeedVal end
+        end)
+        addConn(_speedConn)
+    end
+    do local h = getHuman(); if h then h.WalkSpeed = walkSpeedVal end end
+    enforceSpeed()
+
+    local function makeBillboard(parent, text, color, yOff)
+        local bb = Instance.new("BillboardGui", parent)
+        bb.Size = UDim2.new(0,120,0,24); bb.StudsOffset = Vector3.new(0, yOff or 3, 0)
+        bb.AlwaysOnTop = true; bb.MaxDistance = 200
+        local lbl = Instance.new("TextLabel", bb)
+        lbl.Size = UDim2.new(1,0,1,0); lbl.BackgroundTransparency = 1
+        lbl.Text = text; lbl.TextColor3 = color or Color3.fromRGB(255,70,70)
+        lbl.Font = Enum.Font.GothamBold; lbl.TextSize = 11; lbl.TextStrokeTransparency = 0.2
+        return bb
+    end
+
+    addThread(task.spawn(function()
+        while true do
+            if GEN ~= _G.MeleeRNG_Gen then break end
+            task.wait(0.6)
+            if states.espMobs then
+                local mobs = workspace:FindFirstChild("Mobs")
+                if mobs then
+                    for model, bb in pairs(espBillboards) do
+                        if not isMobAlive(model) then
+                            bb:Destroy(); espBillboards[model] = nil
+                        end
+                    end
+                    for _, model in pairs(mobs:GetChildren()) do
+                        if model:IsA("Model") and isMobAlive(model) and not espBillboards[model] then
+                            local anchor = model:FindFirstChild("Head")
+                                        or model:FindFirstChild("UpperTorso")
+                                        or model:FindFirstChild("HumanoidRootPart")
+                            if anchor then
+                                local isBoss  = model:GetAttribute("Boss") == true
+                                local isMega  = model:GetAttribute("MegaBoss") == true
+                                local col     = isMega and Color3.fromRGB(255,70,70) or isBoss and Color3.fromRGB(255,210,50) or Color3.fromRGB(255,160,30)
+                                local tag     = isMega and " [MEGA]" or isBoss and " [BOSS]" or ""
+                                local label   = model.Name .. tag
+                                local bb = makeBillboard(anchor, label, col, 2.5)
+                                espBillboards[model] = bb
+                            end
+                        end
+                    end
+                end
+            elseif next(espBillboards) then
+                for _, bb in pairs(espBillboards) do pcall(function() bb:Destroy() end) end
+                espBillboards = {}
+            end
+        end
+    end))
+
+    addConn(LP.CharacterAdded:Connect(function(c)
+        if GEN ~= _G.MeleeRNG_Gen then return end
+        task.wait(0.5)
+        rebuildNoclipParts(c)
+        local h = c:WaitForChild("Humanoid", 5)
+        if h then h.WalkSpeed = walkSpeedVal end
+        if flyBV then flyBV:Destroy(); flyBV = nil end
+        if flyBG then flyBG:Destroy(); flyBG = nil end
+        enforceSpeed()
+        _hitboxCacheDirty = true
+        task.defer(function()
+            task.wait(1)
+            if GEN ~= _G.MeleeRNG_Gen then return end
+            maintainPreferredAuraSelection(true)
+        end)
+    end))
+
+    return _fb
+end
+
+-- Anti-AFK in its own scope (keeps main UI IIFE under Luau's ~200-local register cap).
+local function meleeInitAntiAfk()
+    -- Kill the game's AFK LocalScript (no getrawmetatable / newcclosure). Stops its RenderStepped / TP kick path.
+    local function disableGameAfkScript()
+        pcall(function()
+            local ps = LP:FindFirstChild("PlayerScripts")
+            if not ps then return end
+            local s = ps:FindFirstChild("AFKScript")
+            if s and s:IsA("LocalScript") then
+                s.Disabled = true
+            end
+        end)
+    end
+
+    -- Optional backup: game AFK sometimes keys off InputBegan; VIM click path + VirtualUser fallback.
+    -- VirtualUser:ClickButton2 is camera-side and skips that path.
+    local function sendAntiAfkInput()
+        local vx, vy = 1, 1
+        local cam = workspace.CurrentCamera
+        if cam then
+            local vs = cam.ViewportSize
+            vx = math.max(0, math.floor(vs.X * 0.5))
+            vy = math.max(0, math.floor(vs.Y * 0.5))
+        end
+        local okVim = pcall(function()
+            local vim = game:GetService("VirtualInputManager")
+            vim:SendMouseButtonEvent(vx, vy, 0, true)  -- 0 = left, down
+            task.wait()
+            vim:SendMouseButtonEvent(vx, vy, 0, false)
+        end)
+        if okVim then return end
+        pcall(function()
+            VirtualUser:CaptureController()
+            VirtualUser:ClickButton1(Vector2.new(vx, vy))
+        end)
+    end
+
+    addThread(task.spawn(function()
+        local ps = LP:WaitForChild("PlayerScripts", 45)
+        if GEN ~= _G.MeleeRNG_Gen or not ps then return end
+        disableGameAfkScript()
+        addConn(ps.ChildAdded:Connect(function(child)
+            if GEN ~= _G.MeleeRNG_Gen then return end
+            if child.Name == "AFKScript" and child:IsA("LocalScript") then
+                child.Disabled = true
+            end
+        end))
+        while GEN == _G.MeleeRNG_Gen do
+            task.wait(8)
+            disableGameAfkScript()
+        end
+    end))
+
+    addThread(task.spawn(function()
+        while true do
+            if GEN ~= _G.MeleeRNG_Gen then break end
+            task.wait(60)
+            if states.antiAfk then
+                sendAntiAfkInput()
+            end
+        end
+    end))
+end
 
 -- Luau ~200 locals: window UI + return SLbl live in this IIFE; heavy Misc blocks use meleeGuiMountMisc* helpers (Stats+Ascend+Aura is its own function); re-exec init stays outside below.
 local SLbl = (function()
@@ -2952,7 +3198,6 @@ local _TINY_V         = Vector3.new(HITBOX_TINY_STUDS, HITBOX_TINY_STUDS, HITBOX
 local _pulseActive    = false
 local _pulsePhase     = false
 local _hitboxCache    = {}
-local _hitboxCacheDirty = true
 -- Reused every pulse (avoids Vector3.new + table churn)
 local _pulseBigVec    = Vector3.new(hitboxSize, hitboxSize, hitboxSize)
 local HITBOX_DUTY_MAX    = 12
@@ -3392,6 +3637,16 @@ local function perfRestoreAllWeaponFolders()
 end
 
 local _perfLastSoundsMuted = false
+local _perfLastOwnWeaponsHidden = false
+local _perfLastOtherWeaponsHidden = false
+local _perfLastLootHidden = false
+local _perfLastMobManaHidden = false
+local _perfLastHitboxHidden = false
+local _perfLastCharsHidden = false
+local _perfLootAcc = 0
+local _perfMobManaAcc = 0
+local _perfCharAcc = 0
+local _perfHitboxAcc = 0
 
 addThread(task.spawn(function()
     while true do
@@ -3404,53 +3659,97 @@ addThread(task.spawn(function()
         local hv = states.perfHideHitboxVisuals
         local ws = states.perfMuteWorldSounds
         local oc = states.perfHideOtherCharacters
+        local playersNow = Players:GetPlayers()
+        local hadWeaponHide = _perfLastOwnWeaponsHidden or _perfLastOtherWeaponsHidden
+
         if not ow and not sw and not ef and not lo and not mm and not hv and not ws and not oc then
             if _perfLastEffectsHidden then
                 perfRestoreEffects()
                 _perfLastEffectsHidden = false
             end
-            _perfFxAcc = 0
-            perfRestoreAllWeaponFolders()
-            perfRestoreAllLoot()
-            perfRestoreMobManaOrbs()
-            perfRestoreHitboxVisuals()
-            perfSweepOtherCharacters(false)
-            perfCleanupStaleCharKeys()
+            if _perfLastOwnWeaponsHidden then
+                perfSweepWeaponFolder(workspace:FindFirstChild(LP.Name), false)
+                _perfLastOwnWeaponsHidden = false
+            end
+            if _perfLastOtherWeaponsHidden then
+                for _, plr in ipairs(playersNow) do
+                    if plr ~= LP then
+                        perfSweepWeaponFolder(workspace:FindFirstChild(plr.Name), false)
+                    end
+                end
+                _perfLastOtherWeaponsHidden = false
+            end
+            if hadWeaponHide then
+                perfCleanupStalePartKeys()
+            end
+            if _perfLastLootHidden then
+                perfRestoreAllLoot()
+                _perfLastLootHidden = false
+            end
+            if _perfLastMobManaHidden then
+                perfRestoreMobManaOrbs()
+                _perfLastMobManaHidden = false
+            end
+            if _perfLastHitboxHidden then
+                perfRestoreHitboxVisuals()
+                _perfLastHitboxHidden = false
+            end
+            if _perfLastCharsHidden then
+                perfSweepOtherCharacters(false)
+                perfCleanupStaleCharKeys()
+                _perfLastCharsHidden = false
+            end
             if _perfLastSoundsMuted then
                 perfRestoreAllWorldSounds()
                 _perfLastSoundsMuted = false
             end
+            _perfFxAcc = 0
             _perfSoundAcc = 0
+            _perfLootAcc = 0
+            _perfMobManaAcc = 0
+            _perfCharAcc = 0
+            _perfHitboxAcc = 0
             task.wait(0.5)
             continue
         end
-        if ow or sw or mm or (hv and not sw) then
+
+        if ow or sw or (hv and not sw) then
             RunService.Heartbeat:Wait()
         else
             task.wait(0.12)
         end
+
         if sw then
             perfSweepWeaponFolder(workspace:FindFirstChild(LP.Name), true)
-        else
+            _perfLastOwnWeaponsHidden = true
+        elseif _perfLastOwnWeaponsHidden then
             perfSweepWeaponFolder(workspace:FindFirstChild(LP.Name), false)
+            _perfLastOwnWeaponsHidden = false
         end
+
         if ow then
-            for _, plr in ipairs(Players:GetPlayers()) do
+            for _, plr in ipairs(playersNow) do
                 if plr ~= LP then
                     perfSweepWeaponFolder(workspace:FindFirstChild(plr.Name), true)
                 end
             end
-        else
-            for _, plr in ipairs(Players:GetPlayers()) do
+            _perfLastOtherWeaponsHidden = true
+        elseif _perfLastOtherWeaponsHidden then
+            for _, plr in ipairs(playersNow) do
                 if plr ~= LP then
                     perfSweepWeaponFolder(workspace:FindFirstChild(plr.Name), false)
                 end
             end
+            _perfLastOtherWeaponsHidden = false
         end
-        perfCleanupStalePartKeys()
+
+        if sw or ow or _perfLastOwnWeaponsHidden or _perfLastOtherWeaponsHidden then
+            perfCleanupStalePartKeys()
+        end
+
         if ef then
             _perfFxAcc = _perfFxAcc + 1
-            if _perfFxAcc >= 5 then
+            if _perfFxAcc >= 8 then
                 _perfFxAcc = 0
                 perfSweepEffectsHide()
             end
@@ -3460,27 +3759,52 @@ addThread(task.spawn(function()
             perfRestoreEffects()
             _perfLastEffectsHidden = false
         end
+
         if lo then
-            perfSweepLootDrops(true)
-        else
-            perfSweepLootDrops(false)
+            _perfLootAcc = _perfLootAcc + 1
+            if _perfLootAcc >= 2 then
+                _perfLootAcc = 0
+                perfSweepLootDrops(true)
+                perfCleanupStaleLootKeys()
+            end
+            _perfLastLootHidden = true
+        elseif _perfLastLootHidden then
+            _perfLootAcc = 0
+            perfRestoreAllLoot()
+            _perfLastLootHidden = false
         end
-        perfCleanupStaleLootKeys()
+
         if mm then
-            perfSweepMobManaOrbs(true)
-        else
-            perfSweepMobManaOrbs(false)
+            _perfMobManaAcc = _perfMobManaAcc + 1
+            if _perfMobManaAcc >= 2 then
+                _perfMobManaAcc = 0
+                perfSweepMobManaOrbs(true)
+                perfCleanupStaleMobManaKeys()
+            end
+            _perfLastMobManaHidden = true
+        elseif _perfLastMobManaHidden then
+            _perfMobManaAcc = 0
+            perfRestoreMobManaOrbs()
+            _perfLastMobManaHidden = false
         end
-        perfCleanupStaleMobManaKeys()
+
         if hv and not sw then
-            perfSweepHitboxVisuals(true)
-        else
-            perfSweepHitboxVisuals(false)
+            _perfHitboxAcc = _perfHitboxAcc + 1
+            if _perfHitboxAcc >= 3 then
+                _perfHitboxAcc = 0
+                perfSweepHitboxVisuals(true)
+                perfCleanupStaleHitboxVisKeys()
+            end
+            _perfLastHitboxHidden = true
+        elseif _perfLastHitboxHidden then
+            _perfHitboxAcc = 0
+            perfRestoreHitboxVisuals()
+            _perfLastHitboxHidden = false
         end
-        perfCleanupStaleHitboxVisKeys()
+
         if ws then
             _perfSoundAcc = _perfSoundAcc + 1
-            if _perfSoundAcc >= 6 then
+            if _perfSoundAcc >= 15 then
                 _perfSoundAcc = 0
                 perfSweepWorldSoundsMute()
             end
@@ -3490,12 +3814,21 @@ addThread(task.spawn(function()
             _perfLastSoundsMuted = false
             _perfSoundAcc = 0
         end
+
         if oc then
-            perfSweepOtherCharacters(true)
-        else
+            _perfCharAcc = _perfCharAcc + 1
+            if _perfCharAcc >= 3 then
+                _perfCharAcc = 0
+                perfSweepOtherCharacters(true)
+                perfCleanupStaleCharKeys()
+            end
+            _perfLastCharsHidden = true
+        elseif _perfLastCharsHidden then
+            _perfCharAcc = 0
             perfSweepOtherCharacters(false)
+            perfCleanupStaleCharKeys()
+            _perfLastCharsHidden = false
         end
-        perfCleanupStaleCharKeys()
     end
 end))
 
@@ -3873,257 +4206,9 @@ addConn(RunService.Heartbeat:Connect(function()
     end)
 end))
 
--- ── Noclip (cached BaseParts) ─────────────────────────────────
-local noclipParts, noclipConns = {}, {}
-local function clearNoclipConns()
-    for _, c in ipairs(noclipConns) do pcall(function() c:Disconnect() end) end
-    noclipConns = {}
-end
-local function rebuildNoclipParts(char)
-    table.clear(noclipParts); clearNoclipConns()
-    if not char then return end
-    for _, d in ipairs(char:GetDescendants()) do
-        if d:IsA("BasePart") then noclipParts[#noclipParts+1] = d end
-    end
-    noclipConns[#noclipConns+1] = char.DescendantAdded:Connect(function(d)
-        if d:IsA("BasePart") then noclipParts[#noclipParts+1] = d end
-    end)
-end
-rebuildNoclipParts(getChar())
-
-local _lastNoclipPrune = 0
-addConn(RunService.Stepped:Connect(function()
-    if GEN ~= _G.MeleeRNG_Gen then return end
-    if not states.noclip then return end
-    local now = os.clock()
-    if now - _lastNoclipPrune > 5 then
-        _lastNoclipPrune = now
-        for i=#noclipParts,1,-1 do
-            if not (noclipParts[i] and noclipParts[i].Parent) then
-                table.remove(noclipParts, i)
-            end
-        end
-    end
-    for _, p in ipairs(noclipParts) do
-        if p and p.Parent then p.CanCollide = false end
-    end
-end))
-
--- ── God Mode ─────────────────────────────────────────────────
-local _lastGod = 0
-addConn(RunService.Heartbeat:Connect(function()
-    if GEN ~= _G.MeleeRNG_Gen then return end
-    if not states.godMode then return end
-    local now = os.clock(); if now - _lastGod < 0.5 then return end
-    _lastGod = now
-    local h = getHuman()
-    if h then
-        if h.MaxHealth ~= math.huge then h.MaxHealth = math.huge end
-        if h.Health    ~= math.huge then h.Health    = math.huge end
-    end
-end))
-
--- ── Fly ───────────────────────────────────────────────────────
-addConn(RunService.Heartbeat:Connect(function()
-    if GEN ~= _G.MeleeRNG_Gen then return end
-    if states.fly then
-        local root = getRoot(); if not root then return end
-        if not flyBV then
-            flyBV = Instance.new("BodyVelocity", root)
-            flyBV.MaxForce = Vector3.new(1e5,1e5,1e5); flyBV.Velocity = Vector3.zero
-        end
-        if not flyBG then
-            flyBG = Instance.new("BodyGyro", root)
-            flyBG.MaxTorque = Vector3.new(1e5,1e5,1e5); flyBG.D = 100
-        end
-        local cam = workspace.CurrentCamera; local spd = 60; local mv = Vector3.zero
-        if UserInputService:IsKeyDown(Enum.KeyCode.W) then mv = mv + cam.CFrame.LookVector  end
-        if UserInputService:IsKeyDown(Enum.KeyCode.S) then mv = mv - cam.CFrame.LookVector  end
-        if UserInputService:IsKeyDown(Enum.KeyCode.A) then mv = mv - cam.CFrame.RightVector end
-        if UserInputService:IsKeyDown(Enum.KeyCode.D) then mv = mv + cam.CFrame.RightVector end
-        if UserInputService:IsKeyDown(Enum.KeyCode.E) then mv = mv + Vector3.new(0,1,0) end
-        if UserInputService:IsKeyDown(Enum.KeyCode.Q) then mv = mv - Vector3.new(0,1,0) end
-        if mv.Magnitude > 0 then mv = mv.Unit end
-        flyBV.Velocity = mv * spd; flyBG.CFrame = cam.CFrame
-        local h = getHuman(); if h then h:ChangeState(Enum.HumanoidStateType.Physics) end
-    else
-        if flyBV then flyBV:Destroy(); flyBV = nil end
-        if flyBG then flyBG:Destroy(); flyBG = nil end
-    end
-end))
-
--- ── Full Bright ───────────────────────────────────────────────
-local _fbApplied = false
-local _origLight = {
-    Ambient = Lighting.Ambient, OutdoorAmbient = Lighting.OutdoorAmbient,
-    Brightness = Lighting.Brightness, FogEnd = Lighting.FogEnd, FogStart = Lighting.FogStart,
-}
-addConn(RunService.Heartbeat:Connect(function()
-    if GEN ~= _G.MeleeRNG_Gen then return end
-    if states.fullBright then
-        if _fbApplied then return end; _fbApplied = true
-        Lighting.Ambient = Color3.fromRGB(255,255,255)
-        Lighting.OutdoorAmbient = Color3.fromRGB(255,255,255)
-        Lighting.Brightness = 10; Lighting.FogEnd = 1e6; Lighting.FogStart = 1e6
-    elseif _fbApplied then
-        _fbApplied = false
-        Lighting.Ambient = _origLight.Ambient; Lighting.OutdoorAmbient = _origLight.OutdoorAmbient
-        Lighting.Brightness = _origLight.Brightness
-        Lighting.FogEnd = _origLight.FogEnd; Lighting.FogStart = _origLight.FogStart
-    end
-end))
-
--- ── Anti AFK ─────────────────────────────────────────────────
--- Kill the game’s AFK LocalScript (no getrawmetatable / newcclosure). Stops its RenderStepped / TP kick path.
-local function disableGameAfkScript()
-    pcall(function()
-        local ps = LP:FindFirstChild("PlayerScripts")
-        if not ps then return end
-        local s = ps:FindFirstChild("AFKScript")
-        if s and s:IsA("LocalScript") then
-            s.Disabled = true
-        end
-    end)
-end
-
-addThread(task.spawn(function()
-    local ps = LP:WaitForChild("PlayerScripts", 45)
-    if GEN ~= _G.MeleeRNG_Gen or not ps then return end
-    disableGameAfkScript()
-    addConn(ps.ChildAdded:Connect(function(child)
-        if GEN ~= _G.MeleeRNG_Gen then return end
-        if child.Name == "AFKScript" and child:IsA("LocalScript") then
-            child.Disabled = true
-        end
-    end))
-    while GEN == _G.MeleeRNG_Gen do
-        task.wait(8)
-        disableGameAfkScript()
-    end
-end))
-
--- Optional backup: game AFK sometimes keys off InputBegan; VIM click path + VirtualUser fallback.
--- VirtualUser:ClickButton2 is camera-side and skips that path.
-local function sendAntiAfkInput()
-    local vx, vy = 1, 1
-    local cam = workspace.CurrentCamera
-    if cam then
-        local vs = cam.ViewportSize
-        vx = math.max(0, math.floor(vs.X * 0.5))
-        vy = math.max(0, math.floor(vs.Y * 0.5))
-    end
-    local okVim = pcall(function()
-        local vim = game:GetService("VirtualInputManager")
-        vim:SendMouseButtonEvent(vx, vy, 0, true)  -- 0 = left, down
-        task.wait()
-        vim:SendMouseButtonEvent(vx, vy, 0, false)
-    end)
-    if okVim then return end
-    pcall(function()
-        VirtualUser:CaptureController()
-        VirtualUser:ClickButton1(Vector2.new(vx, vy))
-    end)
-end
-
-addThread(task.spawn(function()
-    while true do
-        if GEN ~= _G.MeleeRNG_Gen then break end
-        task.wait(60)
-        if states.antiAfk then
-            sendAntiAfkInput()
-        end
-    end
-end))
-
--- ── WalkSpeed enforcement (re-applies on server reset via metatable) ──
-local _speedConn = nil
-local function enforceSpeed()
-    local h = getHuman(); if not h then return end
-    h.WalkSpeed = walkSpeedVal
-    if _speedConn then _speedConn:Disconnect() end
-    _speedConn = h:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
-        if GEN ~= _G.MeleeRNG_Gen then if _speedConn then _speedConn:Disconnect() end return end
-        if h.WalkSpeed ~= walkSpeedVal then h.WalkSpeed = walkSpeedVal end
-    end)
-    addConn(_speedConn)
-end
-do local h = getHuman(); if h then h.WalkSpeed = walkSpeedVal end end
-enforceSpeed()
-
--- ── ESP — Mob & Loot ─────────────────────────────────────────
-local function makeBillboard(parent, text, color, yOff)
-    local bb = Instance.new("BillboardGui", parent)
-    bb.Size = UDim2.new(0,120,0,24); bb.StudsOffset = Vector3.new(0, yOff or 3, 0)
-    bb.AlwaysOnTop = true; bb.MaxDistance = 200
-    local lbl = Instance.new("TextLabel", bb)
-    lbl.Size = UDim2.new(1,0,1,0); lbl.BackgroundTransparency = 1
-    lbl.Text = text; lbl.TextColor3 = color or C.red
-    lbl.Font = Enum.Font.GothamBold; lbl.TextSize = 11; lbl.TextStrokeTransparency = 0.2
-    return bb
-end
-
-addThread(task.spawn(function()
-    while true do
-        if GEN ~= _G.MeleeRNG_Gen then break end
-        task.wait(0.6)
-
-        -- Mob ESP
-        if states.espMobs then
-            local mobs = workspace:FindFirstChild("Mobs")
-            if mobs then
-                -- Remove stale
-                for model, bb in pairs(espBillboards) do
-                    if not isMobAlive(model) then
-                        bb:Destroy(); espBillboards[model] = nil
-                    end
-                end
-                -- Add new
-                -- Mobs have no Humanoid — label uses model name + boss type
-                for _, model in pairs(mobs:GetChildren()) do
-                    if model:IsA("Model") and isMobAlive(model) and not espBillboards[model] then
-                        -- Attach to Head if present (visible part), else HumanoidRootPart
-                        -- HumanoidRootPart has Transparency=1 so billboard needs a visible anchor
-                        local anchor = model:FindFirstChild("Head")
-                                    or model:FindFirstChild("UpperTorso")
-                                    or model:FindFirstChild("HumanoidRootPart")
-                        if anchor then
-                            local isBoss  = model:GetAttribute("Boss") == true
-                            local isMega  = model:GetAttribute("MegaBoss") == true
-                            local col     = isMega and C.red or isBoss and C.gold or C.orange
-                            local tag     = isMega and " [MEGA]" or isBoss and " [BOSS]" or ""
-                            local label   = model.Name .. tag
-                            local bb = makeBillboard(anchor, label, col, 2.5)
-                            espBillboards[model] = bb
-                        end
-                    end
-                end
-            end
-        elseif next(espBillboards) then
-            for _, bb in pairs(espBillboards) do pcall(function() bb:Destroy() end) end
-            espBillboards = {}
-        end
-
-
-    end
-end))
-
--- ── CharacterAdded ────────────────────────────────────────────
-addConn(LP.CharacterAdded:Connect(function(c)
-    if GEN ~= _G.MeleeRNG_Gen then return end
-    task.wait(0.5)
-    rebuildNoclipParts(c)
-    local h = c:WaitForChild("Humanoid", 5)
-    if h then h.WalkSpeed = walkSpeedVal end
-    if flyBV then flyBV:Destroy(); flyBV = nil end
-    if flyBG then flyBG:Destroy(); flyBG = nil end
-    enforceSpeed()
-    _hitboxCacheDirty = true
-    task.defer(function()
-        task.wait(1)
-        if GEN ~= _G.MeleeRNG_Gen then return end
-        maintainPreferredAuraSelection(true)
-    end)
-end))
+-- ── Movement / combat / ESP / CharacterAdded — own init function (Luau ~200 local cap) ──
+local _fb = meleeInitMovementEspCharAdded()
+meleeInitAntiAfk()
 
 -- ── Auto Ascend loop (ConfirmAscend; gate = (2 + ascends)×1M, not area MinimumKills) ──
 addThread(task.spawn(function()
@@ -4153,6 +4238,7 @@ addThread(task.spawn(function()
     local RAID_POLL_SEC = 1.25
     local RAID_MAX_SEC = 2700
     local FARM_POLL_SEC = 1.5
+    local FARM_TP_LEASH_STUDS = 5
     local function tpAscendSaved()
         local root = getRoot()
         if not root then return false end
@@ -4288,13 +4374,23 @@ addThread(task.spawn(function()
                 local req = getAscendKillsRequired()
                 local dest, killsNeeded = KR.getAscendETA()
                 local kpm = KR.getKillRate()
+                local root = getRoot()
+                local driftDist = 0
+                if root then
+                    local tgt = getAscendAfterTpWorldPos()
+                    driftDist = (root.Position - tgt).Magnitude
+                    if driftDist > FARM_TP_LEASH_STUDS then
+                        tpAscendSaved()
+                    end
+                end
                 meleeAutoFarmStatus.line = string.format(
-                    "🔁 Farm | %s / %s kills (%s left) → %s | ~%.1f KPM",
+                    "🔁 Farm | %s / %s kills (%s left) → %s | ~%.1f KPM | %.0f studs",
                     tostring(k),
                     tostring(req),
                     tostring(killsNeeded),
                     dest and tostring(dest) or "?",
-                    kpm)
+                    kpm,
+                    driftDist)
                 if k >= req then break end
                 task.wait(FARM_POLL_SEC)
             end
@@ -4668,11 +4764,11 @@ MiscTab:Button("🛑", "Stop All Loops", "Disconnects all connections and cancel
     states.fullBright= false; states.espMobs   = false
     cleanupAll()
     -- Restore lighting
-    if _fbApplied then
-        Lighting.Ambient = _origLight.Ambient; Lighting.OutdoorAmbient = _origLight.OutdoorAmbient
-        Lighting.Brightness = _origLight.Brightness
-        Lighting.FogEnd = _origLight.FogEnd; Lighting.FogStart = _origLight.FogStart
-        _fbApplied = false
+    if _fb.applied then
+        Lighting.Ambient = _fb.orig.Ambient; Lighting.OutdoorAmbient = _fb.orig.OutdoorAmbient
+        Lighting.Brightness = _fb.orig.Brightness
+        Lighting.FogEnd = _fb.orig.FogEnd; Lighting.FogStart = _fb.orig.FogStart
+        _fb.applied = false
     end
     -- Remove ESP
     for _, bb in pairs(espBillboards) do pcall(function() bb:Destroy() end) end
