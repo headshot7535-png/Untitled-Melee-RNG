@@ -4368,6 +4368,7 @@ addThread(task.spawn(function()
             SLbl.Text = "🔄 Cycle: farm kills at saved spot"
             tpAscendSaved()
             task.wait(0.5)
+            local farmStartAscends = tonumber(getAscends()) or 0
             meleeAutoFarmStatus.farmPhaseActive = true
             while states.autoCycleFarm and GEN == _G.MeleeRNG_Gen do
                 local k = tonumber(getKills()) or 0
@@ -4399,7 +4400,18 @@ addThread(task.spawn(function()
             if not states.autoCycleFarm or GEN ~= _G.MeleeRNG_Gen then return end
 
             -- ConfirmAscend is only fired from ⬆️ Auto Ascend (or Ascend Now / game UI). Cycle waits for Ascends↑ then TP chase.
-            local beforeA = tonumber(getAscends()) or 0
+            local beforeA = farmStartAscends
+            local nowAAtGate = tonumber(getAscends()) or 0
+            if nowAAtGate > beforeA then
+                if teleportAfterAscendIfConfirmed(beforeA) then
+                    meleeAutoFarmStatus.line = "🔁 Ascended during farm handoff — next loop: TP → raid/farm"
+                    SLbl.Text = "🔄 Cycle: ascended — continuing"
+                else
+                    meleeAutoFarmStatus.line = "🔁 Ascend detected during handoff — TP chase timeout or unclear"
+                    SLbl.Text = "🔄 Cycle: ascend detected — check TP / Ascends"
+                end
+                return
+            end
             meleeAutoFarmStatus.line =
                 "🔁 Kills met — turn ON ⬆️ Auto Ascend (or ascend manually); cycle continues after Ascends increases"
             SLbl.Text = "🔄 Cycle: waiting for ascend (Auto Ascend / manual)"
