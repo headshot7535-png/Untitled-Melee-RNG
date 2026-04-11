@@ -621,7 +621,8 @@ end
 local _getconnections = rawget(_G, "getconnections")
 local AURA_KEEP_POLL_SEC      = 0.2
 local AURA_KEEP_MAX_WAIT_SEC  = 90
-local AURA_NO_ROLL_SKIP_SEC   = 8
+-- Ascend roll UI can appear late; too short a skip exits before KEEP can run
+local AURA_NO_ROLL_SKIP_SEC   = 22
 
 local function fireGuiSignal(sig)
     if not sig then return false end
@@ -815,8 +816,9 @@ local function waitAscendAuraKeepIfNeeded()
     end
 end
 
--- Forward declaration: teleportAfterAscendIfConfirmed spawns a thread that calls this; assign body below after helpers exist.
+-- Forward declaration: teleportAfterAscendIfConfirmed spawns a thread that calls these; bodies assigned below.
 local maintainPreferredAuraSelection
+local forceSelectPreferredAuraNow
 
 --- Wait for Ascends to increase, then keep TPing until local HRP reaches saved position once (or chase timeout).
 local function teleportAfterAscendIfConfirmed(beforeAscends)
@@ -834,8 +836,11 @@ local function teleportAfterAscendIfConfirmed(beforeAscends)
     if not ascended then return false end
 
     waitAscendAuraKeepIfNeeded()
+    -- Re-equip saved preferred aura (e.g. after ascend) even if "Keep selected aura on" is OFF
+    pcall(forceSelectPreferredAuraNow)
     task.spawn(function()
         task.wait(0.75)
+        pcall(forceSelectPreferredAuraNow)
         maintainPreferredAuraSelection(true)
     end)
 
@@ -975,7 +980,7 @@ maintainPreferredAuraSelection = function(forceNow)
 end
 
 --- "fired" = remote sent; "already" = SelectedAura already matches; "fail" = bad name / locked / no remote
-local function forceSelectPreferredAuraNow()
+forceSelectPreferredAuraNow = function()
     local name = states.auraPreferredName
     if type(name) ~= "string" or name == "" then return "fail" end
     if not R("SelectAura") then return "fail" end
@@ -4249,19 +4254,17 @@ addThread(task.spawn(function()
     local function setGameAutoRaid(on)
         return meleeSetGameAutoRaidEnabled(on == true)
     end
-    --- True when no raid SP spend is needed (all capped selections at cap, or no-cap queue empty).
+    --- True when no raid SP spend is needed: every ON+cap row at cap, and no remaining auto-buy candidates.
+    -- (Previously: if any capped row hit cap we returned true and skipped uncapped upgrades — e.g. Kill Mult at cap blocked other upgrades.)
     local function raidSpendPhaseDone()
-        local anyCap = false
         for _, name in ipairs(UPGRADE_ORDER) do
             if upgradeSelected[name] then
                 local capN = upgradeLevelCap[name]
                 if type(capN) == "number" and capN >= 1 then
-                    anyCap = true
                     if upgReadUpgradeLevel(name) < capN then return false end
                 end
             end
         end
-        if anyCap then return true end
         return #upgBuildSortedCandidates() == 0
     end
     --- Count upgrade rows that are ON + have a cap; `need` = how many are still below that cap.
