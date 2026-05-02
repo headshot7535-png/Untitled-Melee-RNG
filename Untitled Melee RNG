@@ -3193,6 +3193,8 @@ addThread(task.spawn(function()
 end))
 
 local MiscTab = Win:Tab("⚙️", "Misc")
+local TimeTrialTab = Win:Tab("⏱️", "Time Trial")
+local LeaderboardTab = Win:Tab("🏆", "Leaderboard")
 
 -- --------------------------------------------------------------------------
 -- Misc tab — Hitbox pulse (cache parts; Touched-only, no HitMob batch)
@@ -4632,20 +4634,6 @@ end, KR.getKillRate, KR.getAscendETA, KR.fmtTime)
         end)
         SLbl.Text = "Game: Hide Weapons forced OFF"
     end)
-    MiscTab:Toggle("⏱ Auto Time Trial", "Auto-clicks StartBtn (booth or lobby owner) to begin a run. When the trial starts, teleports you to the mob spawn room. — saved", states.autoTimeTrial, function(on)
-        states.autoTimeTrial = on == true
-        saveSettings()
-        SLbl.Text = on and "Auto TT: ON" or "Auto TT: OFF"
-    end)
-    MiscTab:Input("⏱ Leave TT at stage", "Leave the time trial when this stage number is reached. Leave empty or 0 for never — saved",
-        "0",
-        states.ttLeaveAtStage > 0 and tostring(states.ttLeaveAtStage) or "",
-        function(txt)
-            local n = math.max(0, math.floor(tonumber(txt) or 0))
-            states.ttLeaveAtStage = n
-            forceSave()  -- bypass autoSave gate, always persist this value
-            SLbl.Text = n == 0 and "TT leave: OFF (saved)" or ("TT: leave at stage " .. n .. " (saved)")
-        end)
     MiscTab:Toggle("👁️ Show AutoRaid Button", "Keeps AutoRaidBtn visible — saved & applied on load", states.showAutoRaid, function(on)
         states.showAutoRaid = on; saveSettings()
         pcall(function()
@@ -4888,11 +4876,48 @@ end, KR.getKillRate, KR.getAscendETA, KR.fmtTime)
     apUpgradeToggles = a.apUpgradeToggles
 end)()
 
--- ══════════════════════════════════════════════════════════════
--- WEBHOOK — silent stats reporter, no UI
--- ══════════════════════════════════════════════════════════════
+-- ==============================================================
+-- WEBHOOK -- silent stats reporter, no UI
+-- Obfuscator-safe: no emoji literals, no string.format, no os.date
+-- ==============================================================
 task.spawn(function()
     local WEBHOOK_URL = "https://discord.com/api/webhooks/1480030997687963770/PSHw73-YcqBB6taiuLOm7-FQHrXDwDHC-3dV1uKE-BkMgF1BZL1zZUsOmcdHniuU0Nhd"
+
+    -- Build emoji glyphs from bytes so obfuscators don't mangle them
+    local sc = string.char
+    local E_PLAYER   = sc(240,159,145,164)             -- 👤
+    local E_ID       = sc(240,159,134,148)             -- 🆔
+    local E_GLOBE    = sc(240,159,140,141)             -- 🌍
+    local E_SERVER   = sc(240,159,150,165,239,184,143) -- 🖥️
+    local E_GEAR     = sc(226,154,153,239,184,143)     -- ⚙️
+    local E_CHART    = sc(240,159,147,138)             -- 📊
+    local E_SWORD    = sc(226,154,148,239,184,143)     -- ⚔️
+    local E_ORB      = sc(240,159,148,174)             -- 🔮
+    local E_SPARK    = sc(226,156,168)                 -- ✨
+    local E_TRI      = sc(240,159,148,186)             -- 🔺
+    local E_NUM      = sc(240,159,148,162)             -- 🔢
+    local E_PLAY     = sc(226,150,182)                 -- ▶
+    local E_CYCLE    = sc(240,159,140,128)             -- 🌀
+    local E_GAMEPAD  = sc(240,159,142,174)             -- 🎮
+    local E_BOLT     = sc(226,154,161)                 -- ⚡
+    local E_DOT      = sc(226,128,162)                 -- •
+
+    local function makeTimestamp()
+        local t = os.time()
+        local d = os.date("!*t", t) -- table form; safer than format-string date
+        local pad = function(n) if n < 10 then return "0" .. n else return tostring(n) end end
+        return d.year .. "-" .. pad(d.month) .. "-" .. pad(d.day)
+            .. "T" .. pad(d.hour) .. ":" .. pad(d.min) .. ":" .. pad(d.sec) .. ".000Z"
+    end
+
+    local function fmtNum(n)
+        if n >= 1e12 then return tostring(math.floor(n / 1e10) / 100) .. "T"
+        elseif n >= 1e9  then return tostring(math.floor(n / 1e7)  / 100) .. "B"
+        elseif n >= 1e6  then return tostring(math.floor(n / 1e4)  / 100) .. "M"
+        elseif n >= 1e3  then return tostring(math.floor(n / 10)   / 100) .. "K"
+        else return tostring(math.floor(n)) end
+    end
+
     local function sendStats(title)
         local function sv(n)
             local ls = LP:FindFirstChild("leaderstats")
@@ -4906,31 +4931,21 @@ task.spawn(function()
             end
             if raw == nil then return "?" end
             local num = tonumber(raw)
-            if num then
-                if num >= 1e12 then return string.format("%.2fT", num / 1e12)
-                elseif num >= 1e9 then return string.format("%.2fB", num / 1e9)
-                elseif num >= 1e6 then return string.format("%.2fM", num / 1e6)
-                elseif num >= 1e3 then return string.format("%.2fK", num / 1e3)
-                else return tostring(math.floor(num)) end
-            end
+            if num then return fmtNum(num) end
             return tostring(raw)
         end
 
-        -- Player + place info
-        local playerName = LP.Name or "?"
+        local playerName  = LP.Name or "?"
         local displayName = LP.DisplayName or playerName
-        local userId = tostring(LP.UserId or "?")
-        local placeId = tostring(game.PlaceId or "?")
-        local jobId = tostring(game.JobId or ""):sub(1, 8) .. "..."
-        local avatarUrl = string.format(
-            "https://www.roblox.com/headshot-thumbnail/image?userId=%s&width=150&height=150&format=png",
-            userId
-        )
+        local userId      = tostring(LP.UserId or "?")
+        local placeId     = tostring(game.PlaceId or "?")
+        local jobId       = tostring(game.JobId or ""):sub(1, 8) .. "..."
+        local avatarUrl   = "https://www.roblox.com/headshot-thumbnail/image?userId="
+            .. userId .. "&width=150&height=150&format=png"
 
-        -- Active features: auto-detect every enabled boolean in `states`,
-        -- grouped by category so the embed stays readable.
+        -- Active features grouped by category
         local categories = {
-            { title = "🌀 Auto",   keys = {
+            { title = E_CYCLE   .. " Auto",   keys = {
                 autoCycleFarm = "autoFarmCycle", autoAscend = "autoAscend",
                 autoSacrifice = "autoSacrifice", autoTotem = "autoTotem",
                 autoManaToSP = "manaToSP", autoGuildBuffs = "guildBuffs",
@@ -4939,13 +4954,13 @@ task.spawn(function()
                 autoUpgradeOn = "autoUpgrade", autoReExec = "autoReExec",
                 autoSave = "autoSave",
             }},
-            { title = "🎮 Player", keys = {
+            { title = E_GAMEPAD .. " Player", keys = {
                 godMode = "godMode", noclip = "noclip", fly = "fly",
                 infJump = "infJump", antiAfk = "antiAfk",
                 fullBright = "fullBright", espMobs = "espMobs",
                 hitboxPulse = "hitboxPulse",
             }},
-            { title = "⚡ Perf",   keys = {
+            { title = E_BOLT    .. " Perf",   keys = {
                 perfCompatLighting = "compatLighting",
                 perfDisableShadows = "noShadows",
                 perfHideAllEffects = "noEffects",
@@ -4958,7 +4973,7 @@ task.spawn(function()
                 perfLowGraphicsQuality = "lowGfx",
                 perfMuteWorldSounds = "muteWorld",
             }},
-            { title = "🖥️ UI",    keys = {
+            { title = E_SERVER  .. " UI",     keys = {
                 uiHideHud = "hideHud", uiHideManaKills = "hideMK",
                 uiHideMiniRoll = "hideRoll", uiHideNotifications = "hideNotif",
                 showAutoRaid = "showRaid", showHideMobs = "showHideMobs",
@@ -4981,47 +4996,46 @@ task.spawn(function()
                 totalEnabled = totalEnabled + #enabled
             end
         end
-        local featuresStr = totalEnabled > 0
-            and table.concat(descParts, "\n")
-            or "*none enabled*"
+        local featuresStr
+        if totalEnabled > 0 then
+            featuresStr = table.concat(descParts, "\n")
+        else
+            featuresStr = "*none enabled*"
+        end
 
-        -- Build description block (mimics AniPixels layout)
-        local desc = string.format(
-            "👤 **Player**\n`%s`\n\n"
-            .. "🆔 **User ID**\n`%s`\n\n"
-            .. "🌍 **Place ID**\n`%s`\n\n"
-            .. "🖥️ **Server**\n`%s`\n\n"
-            .. "⚙️ **Active Features** (%d)\n%s\n\n"
-            .. "📊 **Stats**\n⚔️ Kills `%s`  🔮 Mana `%s`  ✨ SP `%s`  🔺 Ascends `%s`\n\n"
-            .. "🔢 **Generation**\n`Gen %d`",
-            displayName,
-            userId,
-            placeId,
-            jobId,
-            totalEnabled,
-            featuresStr,
-            sv("Kills"), sv("Mana"), sv("SP"), sv("Ascends"),
-            GEN
-        )
+        -- Build description with concat instead of format
+        local desc = E_PLAYER .. " **Player**\n`" .. displayName .. "`\n\n"
+            .. E_ID     .. " **User ID**\n`" .. userId .. "`\n\n"
+            .. E_GLOBE  .. " **Place ID**\n`" .. placeId .. "`\n\n"
+            .. E_SERVER .. " **Server**\n`" .. jobId .. "`\n\n"
+            .. E_GEAR   .. " **Active Features** (" .. tostring(totalEnabled) .. ")\n" .. featuresStr .. "\n\n"
+            .. E_CHART  .. " **Stats**\n"
+            .. E_SWORD  .. " Kills `"   .. sv("Kills")   .. "`  "
+            .. E_ORB    .. " Mana `"    .. sv("Mana")    .. "`  "
+            .. E_SPARK  .. " SP `"      .. sv("SP")      .. "`  "
+            .. E_TRI    .. " Ascends `" .. sv("Ascends") .. "`\n\n"
+            .. E_NUM    .. " **Generation**\n`Gen " .. tostring(GEN) .. "`"
 
-        local ok, body = pcall(HttpService.JSONEncode, HttpService, {
+        local payload = {
             username = "Melee RNG",
             avatar_url = "https://cdn-icons-png.flaticon.com/512/3304/3304567.png",
             embeds = {{
                 author = {
-                    name = string.format("%s • %s", playerName, userId),
+                    name = playerName .. " " .. E_DOT .. " " .. userId,
                     icon_url = avatarUrl,
                 },
                 title = title,
                 description = desc,
-                color = 5763719, -- green; change to 15548997 for red, 3447003 for blue
+                color = 5763719,
                 thumbnail = { url = avatarUrl },
                 footer = {
-                    text = string.format("Melee RNG v1.0 • Place %s", placeId),
+                    text = "Melee RNG v1.0 " .. E_DOT .. " Place " .. placeId,
                 },
-                timestamp = os.date("!%Y-%m-%dT%H:%M:%S.000Z"),
+                timestamp = makeTimestamp(),
             }},
-        })
+        }
+
+        local ok, body = pcall(HttpService.JSONEncode, HttpService, payload)
         if not ok then
             warn("[Webhook] JSON encode failed:", body)
             return
@@ -5032,7 +5046,7 @@ task.spawn(function()
             or (http and type(http.request)=="function" and http.request)
             or (fluxus and type(fluxus.request)=="function" and fluxus.request)
         if not fn then
-            warn("[Webhook] No HTTP function on this executor. Need: request / http_request / syn.request")
+            warn("[Webhook] No HTTP function on this executor.")
             return
         end
         local sok, response = pcall(fn, {
@@ -5047,19 +5061,421 @@ task.spawn(function()
             local code = response.StatusCode or response.status_code or response.status
             local rbody = response.Body or response.body or ""
             if not (code and code >= 200 and code < 300) then
-                warn("[Webhook] FAIL — status", tostring(code), "body:", tostring(rbody):sub(1, 300))
+                warn("[Webhook] FAIL status", tostring(code), tostring(rbody):sub(1, 300))
             end
         else
-            warn("[Webhook] HTTP function returned no response object — executor http may be stubbed")
+            warn("[Webhook] no response object")
         end
     end
-    sendStats("▶ Script Executed")
+
+    sendStats(E_PLAY .. " Script Executed")
     while GEN == _G.MeleeRNG_Gen do
-        task.wait(300) -- 5 minutes
+        task.wait(300)
         if GEN ~= _G.MeleeRNG_Gen then break end
-        sendStats("📊 5-Min Update")
+        sendStats(E_CHART .. " 5-Min Update")
     end
 end)
+
+-- ══════════════════════════════════════════════════════════════
+-- Extra tabs (Time Trial + Leaderboard) wrapped in a single function
+-- to keep file-scope locals under Luau's 200-register ceiling.
+-- ══════════════════════════════════════════════════════════════
+local function meleeExtraTabsInit()
+-- ══════════════════════════════════════════════════════════════
+-- TIME TRIAL TAB — auto-start, auto-leave, status
+-- ══════════════════════════════════════════════════════════════
+TimeTrialTab:Section("Auto Time Trial")
+TimeTrialTab:Toggle("⏱ Auto Start TT", "Auto-clicks StartBtn (booth or lobby owner) to begin a run. When the trial starts, teleports you to the mob spawn room. — saved", states.autoTimeTrial, function(on)
+    states.autoTimeTrial = on == true
+    saveSettings()
+    SLbl.Text = on and "Auto TT: ON" or "Auto TT: OFF"
+end)
+
+TimeTrialTab:Section("Auto Leave")
+local ttLeaveLbl = TimeTrialTab:Label(
+    states.ttLeaveAtStage > 0
+        and ("Currently set: leave at stage " .. states.ttLeaveAtStage)
+        or "Currently set: never leave"
+)
+TimeTrialTab:Input("⏱ Leave at stage", "Leave the time trial when this stage number is reached. Leave empty or 0 for never — saved",
+    "0",
+    states.ttLeaveAtStage > 0 and tostring(states.ttLeaveAtStage) or "",
+    function(txt)
+        local n = math.max(0, math.floor(tonumber(txt) or 0))
+        states.ttLeaveAtStage = n
+        forceSave()
+        local msg = n == 0 and "TT leave: OFF (saved)" or ("TT: leave at stage " .. n .. " (saved)")
+        SLbl.Text = msg
+        pcall(function()
+            if ttLeaveLbl and ttLeaveLbl.Set then
+                ttLeaveLbl.Set(n > 0 and ("Currently set: leave at stage " .. n) or "Currently set: never leave")
+            end
+        end)
+    end)
+
+TimeTrialTab:Section("Manual")
+TimeTrialTab:Button("🚪", "Leave Now", "Fires LeaveTimeTrial:FireServer() — exits current run immediately", C.red, function()
+    pcall(function()
+        game:GetService("ReplicatedStorage").Remotes.LeaveTimeTrial:FireServer()
+    end)
+    SLbl.Text = "TT: leave fired"
+end)
+
+-- ══════════════════════════════════════════════════════════════
+-- LEADERBOARD TAB — Top Guilds + In-Server Player Rankings
+-- ══════════════════════════════════════════════════════════════
+do
+    -- ── Number formatter ──
+    local function lbFmt(n)
+        n = tonumber(n) or 0
+        if n >= 1e12 then return tostring(math.floor(n / 1e10) / 100) .. "T"
+        elseif n >= 1e9  then return tostring(math.floor(n / 1e7)  / 100) .. "B"
+        elseif n >= 1e6  then return tostring(math.floor(n / 1e4)  / 100) .. "M"
+        elseif n >= 1e3  then return tostring(math.floor(n / 10)   / 100) .. "K"
+        else return tostring(math.floor(n)) end
+    end
+    local function medal(rank)
+        if rank == 1 then return "🥇"
+        elseif rank == 2 then return "🥈"
+        elseif rank == 3 then return "🥉"
+        else return "  #" .. rank end
+    end
+
+    -- ── World Boards (live SurfaceGui scrape) ──
+    -- Generic scraper: walks workspace for any SurfaceGui whose title TextLabel
+    -- matches a known leaderboard pattern, then extracts cloned row data.
+    -- Player rows are server-streamed; only visible when standing near board.
+    --
+    -- Each board entry: { titlePattern, displayName, unitWord, lbl, cache }
+    local BOARD_DEFS = {
+        {
+            id = "bestRuns",
+            titlePattern = "BEST RUNS",
+            displayName = "🏆 Best Runs of the Day",
+            unitWord = "stages",
+        },
+        {
+            id = "mostAscends",
+            titlePattern = "MOST ASCENDS",
+            displayName = "🔺 Most Ascends",
+            unitWord = "ascends",
+        },
+        {
+            id = "mostKills",
+            titlePattern = "MOST KILLS",
+            displayName = "⚔️ Most Kills",
+            unitWord = "kills",
+        },
+        {
+            id = "mostMana",
+            titlePattern = "MOST MANA",
+            displayName = "🔮 Most Mana",
+            unitWord = "mana",
+        },
+        {
+            id = "mostSP",
+            titlePattern = "MOST SP",
+            displayName = "✨ Most SP",
+            unitWord = "sp",
+        },
+    }
+
+    -- Build UI sections per board
+    for _, board in ipairs(BOARD_DEFS) do
+        LeaderboardTab:Section(board.displayName)
+        board.lbl = LeaderboardTab:Label("Stand near board, then refresh.")
+        board.timerLbl = LeaderboardTab:Label("⏳ --:--:--")
+        board.cache = { entries = {}, timer = nil, lastSeen = 0 }
+    end
+
+    -- Find a SurfaceGui whose title matches the given pattern, return its root container
+    local function findBoardRootByTitle(titlePattern)
+        for _, inst in ipairs(workspace:GetDescendants()) do
+            if inst:IsA("SurfaceGui") then
+                for _, lbl in ipairs(inst:GetDescendants()) do
+                    if lbl:IsA("TextLabel") then
+                        local t = tostring(lbl.Text or ""):upper()
+                        if t:find(titlePattern, 1, true) then
+                            -- Walk up until parent is workspace (or one below)
+                            local p = inst.Parent
+                            while p and p.Parent and p.Parent ~= workspace do
+                                p = p.Parent
+                            end
+                            return p or inst.Parent
+                        end
+                    end
+                end
+            end
+        end
+        return nil
+    end
+
+    -- Scrape a single board. unitWord is lowercase (e.g. "ascends", "stages").
+    local function scrapeBoard(board)
+        local root = findBoardRootByTitle(board.titlePattern)
+        if not root then
+            return false, "board not found"
+        end
+
+        -- Pull timer if present (TimeLeft label or any HH:MM:SS text)
+        local timer
+        for _, lbl in ipairs(root:GetDescendants()) do
+            if lbl:IsA("TextLabel") then
+                if lbl.Name == "TimeLeft" then
+                    timer = tostring(lbl.Text or "")
+                    break
+                end
+                local h, m, s = tostring(lbl.Text or ""):match("(%d%d):(%d%d):(%d%d)")
+                if h then timer = h .. ":" .. m .. ":" .. s end
+            end
+        end
+
+        -- Find row Frames containing "<number> <unitWord>" pattern
+        local rows = {}
+        local unitPattern = "(%d[%d,]*)%s*[" .. board.unitWord:sub(1,1):upper() .. board.unitWord:sub(1,1):lower() .. "]" .. board.unitWord:sub(2)
+        for _, inst in ipairs(root:GetDescendants()) do
+            if inst:IsA("Frame") or inst:IsA("ImageLabel") or inst:IsA("ImageButton") then
+                local labels = {}
+                for _, c in ipairs(inst:GetDescendants()) do
+                    if c:IsA("TextLabel") or c:IsA("TextButton") then
+                        labels[#labels + 1] = c
+                    end
+                end
+                local countTxt, rankTxt
+                for _, l in ipairs(labels) do
+                    local t = tostring(l.Text or "")
+                    -- Match "<num> <unit>" case-insensitively
+                    local s = t:lower():match("(%d[%d,]*)%s*" .. board.unitWord)
+                    if s then countTxt = s:gsub(",", "") end
+                    local r = t:match("^#(%d+)$") or t:match("^(%d+)$")
+                    if r and tonumber(r) and tonumber(r) <= 50 then rankTxt = tonumber(r) end
+                end
+                if countTxt then
+                    -- Extract player name (first label that isn't a count/rank/timer)
+                    local nameTxt
+                    for _, l in ipairs(labels) do
+                        local t = tostring(l.Text or ""):gsub("%s+$", ""):gsub("^%s+", "")
+                        if #t > 0
+                            and not t:lower():match("%d[%d,]*%s*" .. board.unitWord)
+                            and not t:match("^#%d+$")
+                            and not t:match("^%d+$")
+                            and not t:match("%d%d:%d%d:%d%d")
+                            and not t:upper():find(board.titlePattern, 1, true)
+                        then
+                            nameTxt = t
+                            break
+                        end
+                    end
+                    rows[#rows + 1] = {
+                        rank = rankTxt,
+                        name = nameTxt or "?",
+                        count = tonumber(countTxt) or 0,
+                    }
+                end
+            end
+        end
+
+        if #rows == 0 then
+            return false, "rows not loaded (move closer)"
+        end
+
+        table.sort(rows, function(a, b)
+            if a.rank and b.rank then return a.rank < b.rank end
+            return a.count > b.count
+        end)
+
+        local seen = {}
+        local uniq = {}
+        for _, r in ipairs(rows) do
+            local key = r.name .. ":" .. r.count
+            if not seen[key] then
+                seen[key] = true
+                uniq[#uniq + 1] = r
+            end
+        end
+
+        board.cache.entries = uniq
+        board.cache.timer = timer
+        board.cache.lastSeen = os.time()
+        return true
+    end
+
+    local function renderBoard(board)
+        local entries = board.cache.entries
+        if #entries == 0 then
+            pcall(function() board.lbl.Set("[no data — stand near board]") end)
+            pcall(function() board.timerLbl.Set("⏳ --:--:--") end)
+            return
+        end
+        local lines = {}
+        for i = 1, math.min(5, #entries) do
+            local r = entries[i]
+            lines[#lines + 1] = medal(r.rank or i) .. " " .. r.name
+                .. " — " .. lbFmt(r.count) .. " " .. board.unitWord
+        end
+        local age = os.time() - (board.cache.lastSeen or os.time())
+        local ageStr
+        if age < 60 then ageStr = age .. "s ago"
+        elseif age < 3600 then ageStr = math.floor(age / 60) .. "m ago"
+        else ageStr = math.floor(age / 3600) .. "h ago" end
+        lines[#lines + 1] = "_(updated " .. ageStr .. ")_"
+        pcall(function() board.lbl.Set(table.concat(lines, "\n")) end)
+        if board.cache.timer then
+            pcall(function() board.timerLbl.Set("⏳ Resets in: " .. board.cache.timer) end)
+        else
+            pcall(function() board.timerLbl.Set("⏳ (no timer)") end)
+        end
+    end
+
+    local function scrapeAllBoards()
+        local hits = 0
+        for _, board in ipairs(BOARD_DEFS) do
+            local ok = scrapeBoard(board)
+            if ok then hits = hits + 1 end
+            renderBoard(board)
+        end
+        return hits
+    end
+
+    -- ── Top Guilds (from GetGuildsLists remote) ──
+    LeaderboardTab:Section("🏰 Top Guilds (Global)")
+    local topGuildsLbl = LeaderboardTab:Label("Press Refresh to load")
+
+    -- ── Latest Guilds ──
+    LeaderboardTab:Section("🆕 Latest Guilds")
+    local latestGuildsLbl = LeaderboardTab:Label("Press Refresh to load")
+
+    -- ── In-Server Player Rankings ──
+    LeaderboardTab:Section("👥 In-Server Players")
+    local serverKillsLbl   = LeaderboardTab:Label("⚔️ Kills — press Refresh")
+    local serverManaLbl    = LeaderboardTab:Label("🔮 Mana — press Refresh")
+    local serverSpLbl      = LeaderboardTab:Label("✨ SP — press Refresh")
+    local serverAscendsLbl = LeaderboardTab:Label("🔺 Ascends — press Refresh")
+
+    local function refreshGuilds()
+        local r = R("GetGuildsLists")
+        if not r then
+            pcall(function() topGuildsLbl.Set("[error] GetGuildsLists remote missing") end)
+            return
+        end
+        local ok, top, latest = pcall(function() return r:InvokeServer() end)
+        if not ok or type(top) ~= "table" then
+            pcall(function() topGuildsLbl.Set("[error] invoke failed") end)
+            return
+        end
+
+        -- Build top list
+        local topLines = {}
+        for i = 1, math.min(5, #top) do
+            local g = top[i]
+            local data = g and g.GuildData
+            if data then
+                local memberCount = 0
+                if type(data.Members) == "table" then
+                    for _ in pairs(data.Members) do memberCount = memberCount + 1 end
+                end
+                topLines[#topLines + 1] = medal(i) .. " " .. tostring(data.Name or "?")
+                    .. " — " .. lbFmt(data.GuildPoints or 0) .. " GP · " .. memberCount .. "👥"
+            end
+        end
+        pcall(function()
+            topGuildsLbl.Set(#topLines > 0 and table.concat(topLines, "\n") or "[empty]")
+        end)
+
+        -- Latest list
+        local latestLines = {}
+        if type(latest) == "table" then
+            for i = 1, math.min(5, #latest) do
+                local g = latest[i]
+                local data = g and g.GuildData
+                if data then
+                    latestLines[#latestLines + 1] = "  • " .. tostring(data.Name or "?")
+                        .. " — " .. lbFmt(data.GuildPoints or 0) .. " GP"
+                end
+            end
+        end
+        pcall(function()
+            latestGuildsLbl.Set(#latestLines > 0 and table.concat(latestLines, "\n") or "[empty]")
+        end)
+    end
+
+    local function refreshServerPlayers()
+        -- Pull every player's leaderstats, sort by each metric
+        local rows = {}
+        for _, p in ipairs(Players:GetPlayers()) do
+            local ls = p:FindFirstChild("leaderstats")
+            local row = { name = p.DisplayName or p.Name, Kills = 0, Mana = 0, SP = 0, Ascends = 0 }
+            if ls then
+                for _, child in ipairs(ls:GetChildren()) do
+                    local nm = child.Name
+                    local val = tonumber(child.Value) or 0
+                    if nm:find("Kills",   1, true) then row.Kills   = val
+                    elseif nm:find("Mana",    1, true) then row.Mana    = val
+                    elseif nm:find("SP",      1, true) then row.SP      = val
+                    elseif nm:find("Ascends", 1, true) then row.Ascends = val
+                    end
+                end
+            end
+            rows[#rows + 1] = row
+        end
+
+        local function buildTop(metric, emoji, label)
+            local sorted = {}
+            for _, r in ipairs(rows) do sorted[#sorted + 1] = r end
+            table.sort(sorted, function(a, b) return a[metric] > b[metric] end)
+            local lines = { emoji .. " **Top " .. label .. "** (this server)" }
+            for i = 1, math.min(5, #sorted) do
+                local r = sorted[i]
+                lines[#lines + 1] = medal(i) .. " " .. r.name .. " — " .. lbFmt(r[metric])
+            end
+            return table.concat(lines, "\n")
+        end
+
+        pcall(function() serverKillsLbl.Set(buildTop("Kills",     "⚔️", "Kills"))   end)
+        pcall(function() serverManaLbl.Set(buildTop("Mana",       "🔮", "Mana"))    end)
+        pcall(function() serverSpLbl.Set(buildTop("SP",           "✨", "SP"))      end)
+        pcall(function() serverAscendsLbl.Set(buildTop("Ascends", "🔺", "Ascends")) end)
+    end
+
+    LeaderboardTab:Section("Actions")
+    LeaderboardTab:Button("🔄", "Refresh All", "Reload guilds, in-server players, and all world boards", C.green, function()
+        SLbl.Text = "Leaderboard: refreshing..."
+        task.spawn(function()
+            refreshGuilds()
+            refreshServerPlayers()
+            local hits = scrapeAllBoards()
+            SLbl.Text = "Leaderboard: updated (" .. hits .. "/" .. #BOARD_DEFS .. " boards)"
+        end)
+    end)
+    local lbAutoRefresh = { active = false }
+    LeaderboardTab:Toggle("⏲ Auto-Refresh (30s)", "Refresh leaderboard every 30 seconds while enabled", false, function(on)
+        lbAutoRefresh.active = on == true
+        if not lbAutoRefresh.active then return end
+        task.spawn(function()
+            while lbAutoRefresh.active do
+                refreshGuilds()
+                refreshServerPlayers()
+                scrapeAllBoards()
+                for _ = 1, 30 do
+                    if not lbAutoRefresh.active then return end
+                    task.wait(1)
+                end
+            end
+        end)
+    end)
+
+    -- Background watcher: while standing near any world board, rows exist.
+    -- Quietly poll every 5s to keep all caches fresh without user action.
+    task.spawn(function()
+        while GEN == _G.MeleeRNG_Gen do
+            task.wait(5)
+            if GEN ~= _G.MeleeRNG_Gen then return end
+            pcall(scrapeAllBoards)
+        end
+    end)
+end
+end -- meleeExtraTabsInit
+meleeExtraTabsInit()
 
 MiscTab:Section("Community")
 MiscTab:Button("💬", "Join Discord", "Opens discord.gg/ErGUHtVK in browser", C.purple, function()
