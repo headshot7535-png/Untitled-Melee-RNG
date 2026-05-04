@@ -401,6 +401,7 @@ local states = {
     perfCompatLighting   = false, -- Lighting.Technology → Compatibility
     perfLowGraphicsQuality = false, -- UserGameSettings quality (executor/client dependent)
     perfHideOtherCharacters = false, -- other players’ Character rigs invisible locally (intrusive)
+    perfMobOptimize      = false, -- TT lag fix: disable mob animations/physics/sounds/VFX (combat unaffected)
 }
 
 -- Auto Farm cycle: live status (not in states — avoids persisting to settings JSON)
@@ -588,6 +589,7 @@ states.perfMuteWorldSounds = states.perfMuteWorldSounds == true
 states.perfCompatLighting = states.perfCompatLighting == true
 states.perfLowGraphicsQuality = states.perfLowGraphicsQuality == true
 states.perfHideOtherCharacters = states.perfHideOtherCharacters == true
+states.perfMobOptimize = states.perfMobOptimize == true
 states.uiHideManaKills = states.uiHideManaKills == true
 states.uiHideMiniRoll  = states.uiHideMiniRoll == true
 states.uiHideHud       = states.uiHideHud == true
@@ -1193,7 +1195,96 @@ local function meleeGuiMountMiscStatsLabelsAscendAura(MiscTab, SLbl, C, guildApG
     local StatsLbl = MiscTab:Label("Kills: — | Mana: — | SP: — | Ascends: —")
     local KPMLbl   = MiscTab:Label("KPM: — | ETA ascend: —")
     local ETALbl   = MiscTab:Label("Ascend: — / — kills —")
+    local DPSLbl   = MiscTab:Label("DPS: — | Peak: — | Total: —")
     local AuraStatLbl = MiscTab:Label("Aura: equipped — | roll UI —")
+
+    -- DPS tracker: hook __namecall to observe Remotes.HitMob:FireServer(buffer).
+    -- The previous attempt with newcclosure wrapper broke arithmetic in the
+    -- game's controllers because the wrapper mangled return values for
+    -- unrelated namecalls. This version uses no wrapper — passes (...) through
+    -- to oldNamecall verbatim, only observing when the target matches HitMob.
+    local _dpsWindow = {}
+    local _dpsWindowSec = 5
+    local _dpsTotalDmg = 0
+    local _dpsPeak = 0
+    local _dpsHookOk = false
+
+    task.spawn(function()
+        local remotes = RS:WaitForChild("Remotes", 30)
+        if not remotes then return end
+        local hitMob = remotes:WaitForChild("HitMob", 30)
+        if not hitMob then return end
+
+        local hmm = rawget(getfenv(), "hookmetamethod") or hookmetamethod
+        local gnm = rawget(getfenv(), "getnamecallmethod") or getnamecallmethod
+        local checkcaller = rawget(getfenv(), "checkcaller") or function() return false end
+        if not hmm or not gnm then return end
+
+        local oldNamecall
+        oldNamecall = hmm(game, "__namecall", function(self, ...)
+            if self == hitMob and not checkcaller() then
+                local method = gnm()
+                if method == "FireServer" then
+                    pcall(function(buffer)
+                        if type(buffer) == "table" then
+                            for _, entry in ipairs(buffer) do
+                                if type(entry) == "table" then
+                                    local dmg = tonumber(entry[2])
+                                    if dmg and dmg > 0 then
+                                        _dpsTotalDmg = _dpsTotalDmg + dmg
+                                        _dpsWindow[#_dpsWindow + 1] = { t = os.clock(), dmg = dmg }
+                                        -- Hard cap: prevent unbounded growth on extreme KPM. If we have
+                                        -- more than 5000 entries (way more than 5 sec of damage at any
+                                        -- realistic rate), drop the oldest half to keep memory in check.
+                                        if #_dpsWindow > 5000 then
+                                            local kept = {}
+                                            for i = 2500, #_dpsWindow do kept[#kept + 1] = _dpsWindow[i] end
+                                            _dpsWindow = kept
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end, (...))
+                end
+            end
+            return oldNamecall(self, ...)
+        end)
+
+        _dpsHookOk = true
+    end)
+
+    local function getDPS()
+        local now = os.clock()
+        local cutoff = now - _dpsWindowSec
+        local i = 1
+        while i <= #_dpsWindow and _dpsWindow[i].t < cutoff do
+            i = i + 1
+        end
+        if i > 1 then
+            for j = 1, #_dpsWindow - i + 1 do _dpsWindow[j] = _dpsWindow[j + i - 1] end
+            for j = #_dpsWindow - i + 2, #_dpsWindow do _dpsWindow[j] = nil end
+        end
+        local sum = 0
+        for _, e in ipairs(_dpsWindow) do sum = sum + e.dmg end
+        local dps = sum / _dpsWindowSec
+        if dps > _dpsPeak then _dpsPeak = dps end
+        return dps
+    end
+    local function fmtDmg(n)
+        n = tonumber(n) or 0
+        if n >= 1e12 then return string.format("%.2fT", n / 1e12)
+        elseif n >= 1e9 then return string.format("%.2fB", n / 1e9)
+        elseif n >= 1e6 then return string.format("%.2fM", n / 1e6)
+        elseif n >= 1e3 then return string.format("%.1fK", n / 1e3)
+        else return tostring(math.floor(n)) end
+    end
+    MiscTab:Button("🔄", "Reset DPS Stats", "Clears peak DPS + total damage", C.gray or C.purple, function()
+        _dpsWindow = {}
+        _dpsTotalDmg = 0
+        _dpsPeak = 0
+        SLbl.Text = "DPS stats reset"
+    end)
 
     local miscAscendGui = meleeGuiMountMiscAscendSection(MiscTab, SLbl, C)
     meleeGuiMountMiscAuraSection(MiscTab, SLbl, C)
@@ -1235,6 +1326,16 @@ local function meleeGuiMountMiscStatsLabelsAscendAura(MiscTab, SLbl, C, guildApG
                 else
                     KPMLbl.Set(string.format("KPM: %.1f | Ascend: —", kpm))
                     ETALbl.Set("Ascend: —")
+                end
+                -- DPS update
+                local dps = getDPS()
+                if not _dpsHookOk then
+                    DPSLbl.Set("DPS: [hook attaching...]")
+                elseif _dpsTotalDmg == 0 then
+                    DPSLbl.Set("DPS: [waiting for first damage]")
+                else
+                    DPSLbl.Set(string.format("DPS: %s | Peak: %s | Total: %s",
+                        fmtDmg(dps), fmtDmg(_dpsPeak), fmtDmg(_dpsTotalDmg)))
                 end
                 local eqA = getEquippedAuraName()
                 local rollA = getRolledAuraNameFromRollUi()
@@ -3648,6 +3749,146 @@ local function perfRestoreAllWeaponFolders()
     perfCleanupStalePartKeys()
 end
 
+-- ── Mob Heavy Optimization (for late-stage TT lag) ─────────────
+-- Stored as a global field on the script-internal namespace to avoid
+-- consuming a file-scope local register (we're near Luau's 200 limit).
+_G.MeleeRNG_mobOpt = (function()
+    local _perfMobOptimized = setmetatable({}, { __mode = "k" })  -- weak keys: dead Models GC away
+    local _perfMobConn = nil          -- folder ChildAdded conn
+    local _perfMobConnRS = nil        -- ReplicatedStorage.Mobs ChildAdded conn
+
+    local function perfOptimizeOneMob(model)
+        if not (model and model.Parent and model:IsA("Model")) then return end
+        if _perfMobOptimized[model] then return end
+        local rec = {
+            anchors = setmetatable({}, { __mode = "k" }),
+            sounds  = setmetatable({}, { __mode = "k" }),
+            fx      = setmetatable({}, { __mode = "k" }),
+        }
+
+        for _, d in ipairs(model:GetDescendants()) do
+            if d:IsA("Animator") then
+                pcall(function()
+                    for _, track in ipairs(d:GetPlayingAnimationTracks()) do
+                        track:Stop(0)
+                    end
+                end)
+            elseif d:IsA("AnimationController") or d:IsA("Humanoid") then
+                for _, c in ipairs(d:GetChildren()) do
+                    if c:IsA("Animator") then
+                        pcall(function()
+                            for _, track in ipairs(c:GetPlayingAnimationTracks()) do
+                                track:Stop(0)
+                            end
+                        end)
+                    end
+                end
+            end
+            if d:IsA("BasePart") then
+                if rec.anchors[d] == nil then rec.anchors[d] = d.Anchored end
+                d.Anchored = true
+            end
+            if d:IsA("Sound") then
+                rec.sounds[d] = d.Playing
+                pcall(function() d:Stop() end)
+            end
+            if d:IsA("ParticleEmitter") or d:IsA("Trail") or d:IsA("Beam")
+                or d:IsA("Fire") or d:IsA("Smoke") or d:IsA("Sparkles") then
+                rec.fx[d] = d.Enabled
+                d.Enabled = false
+            end
+        end
+
+        _perfMobOptimized[model] = rec
+        -- No AncestryChanged connection — we use weak-key tables so the GC
+        -- handles cleanup automatically when mobs despawn. This avoids the
+        -- connection leak that builds up over long sessions.
+    end
+
+    local function perfRestoreOneMob(model)
+        local rec = _perfMobOptimized[model]
+        if not rec then return end
+        for part, original in pairs(rec.anchors) do
+            if part and part.Parent then
+                pcall(function() part.Anchored = original end)
+            end
+        end
+        for snd, wasPlaying in pairs(rec.sounds) do
+            if snd and snd.Parent and wasPlaying then
+                pcall(function() snd:Play() end)
+            end
+        end
+        for inst, wasEnabled in pairs(rec.fx) do
+            if inst and inst.Parent then
+                pcall(function() inst.Enabled = wasEnabled end)
+            end
+        end
+        _perfMobOptimized[model] = nil
+    end
+
+    local function perfMobOptimizerSweepFolder(folder)
+        if not folder then return end
+        for _, child in ipairs(folder:GetChildren()) do
+            if child:IsA("Model") then
+                perfOptimizeOneMob(child)
+            end
+        end
+    end
+
+    local function enable()
+        local wsMobs = workspace:FindFirstChild("Mobs")
+        if wsMobs then
+            perfMobOptimizerSweepFolder(wsMobs)
+            if _perfMobConn then _perfMobConn:Disconnect() end
+            _perfMobConn = wsMobs.ChildAdded:Connect(function(child)
+                task.wait(0.1)
+                perfOptimizeOneMob(child)
+            end)
+        end
+        local rsMobs = RS:FindFirstChild("Mobs")
+        if rsMobs then
+            perfMobOptimizerSweepFolder(rsMobs)
+            if _perfMobConnRS then _perfMobConnRS:Disconnect() end
+            _perfMobConnRS = rsMobs.ChildAdded:Connect(function(child)
+                task.wait(0.1)
+                perfOptimizeOneMob(child)
+            end)
+        end
+        addConn(workspace.ChildAdded:Connect(function(c)
+            if c.Name == "Mobs" and states.perfMobOptimize then
+                task.wait(0.05)
+                perfMobOptimizerSweepFolder(c)
+                if _perfMobConn then _perfMobConn:Disconnect() end
+                _perfMobConn = c.ChildAdded:Connect(function(child)
+                    task.wait(0.1)
+                    perfOptimizeOneMob(child)
+                end)
+            end
+        end))
+        addConn(RS.ChildAdded:Connect(function(c)
+            if c.Name == "Mobs" and states.perfMobOptimize then
+                task.wait(0.05)
+                perfMobOptimizerSweepFolder(c)
+                if _perfMobConnRS then _perfMobConnRS:Disconnect() end
+                _perfMobConnRS = c.ChildAdded:Connect(function(child)
+                    task.wait(0.1)
+                    perfOptimizeOneMob(child)
+                end)
+            end
+        end))
+    end
+
+    local function disable()
+        if _perfMobConn then _perfMobConn:Disconnect(); _perfMobConn = nil end
+        if _perfMobConnRS then _perfMobConnRS:Disconnect(); _perfMobConnRS = nil end
+        local toRestore = {}
+        for m in pairs(_perfMobOptimized) do toRestore[#toRestore + 1] = m end
+        for _, m in ipairs(toRestore) do perfRestoreOneMob(m) end
+    end
+
+    return { enable = enable, disable = disable }
+end)()
+
 local _perfLastSoundsMuted = false
 local _perfLastOwnWeaponsHidden = false
 local _perfLastOtherWeaponsHidden = false
@@ -3658,10 +3899,6 @@ local _perfLastCharsHidden = false
 local _perfLootAcc = 0
 local _perfMobManaAcc = 0
 local _perfCharAcc = 0
-local _perfHitboxAcc = 0
-
-local _perfHitboxAcc = 0
-
 local _perfHitboxAcc = 0
 
 -- ── Auto Time Trial ──────────────────────────────────────────────────────────
@@ -4749,6 +4986,17 @@ end, KR.getKillRate, KR.getAscendETA, KR.fmtTime)
         end
         SLbl.Text = on and "Perf: workspace VFX off" or "Perf: workspace VFX restored"
     end)
+    perfUi.mobopt = MiscTab:Toggle("🦴 Mob Heavy Optimize (TT lag fix)", "Per-mob: stops animations, anchors physics, mutes sounds, kills VFX. Combat unaffected (damage uses ID lookup, no Humanoid). Big FPS gain in late TT — saved", states.perfMobOptimize, function(on)
+        states.perfMobOptimize = on == true
+        saveSettings()
+        if on then
+            if _G.MeleeRNG_mobOpt then pcall(_G.MeleeRNG_mobOpt.enable) end
+            SLbl.Text = "Perf: mobs optimized (animations/physics off)"
+        else
+            if _G.MeleeRNG_mobOpt then pcall(_G.MeleeRNG_mobOpt.disable) end
+            SLbl.Text = "Perf: mobs restored"
+        end
+    end)
     perfUi.loot = MiscTab:Toggle("Hide Loot Drops", "Hides dropped weapons under workspace.Loot (client visibility only) — saved", states.perfHideLootDrops, function(on)
         states.perfHideLootDrops = on == true
         saveSettings()
@@ -4972,6 +5220,7 @@ task.spawn(function()
                 perfHideOwnWeapons = "noOwnWep",
                 perfLowGraphicsQuality = "lowGfx",
                 perfMuteWorldSounds = "muteWorld",
+                perfMobOptimize = "mobOptimize",
             }},
             { title = E_SERVER  .. " UI",     keys = {
                 uiHideHud = "hideHud", uiHideManaKills = "hideMK",
@@ -5077,10 +5326,10 @@ task.spawn(function()
 end)
 
 -- ══════════════════════════════════════════════════════════════
--- Extra tabs (Time Trial + Leaderboard) wrapped in a single function
--- to keep file-scope locals under Luau's 200-register ceiling.
+-- Extra tabs (Time Trial + Leaderboard) wrapped in an IIFE so its
+-- locals don't count against Luau's file-scope 200-register limit.
 -- ══════════════════════════════════════════════════════════════
-local function meleeExtraTabsInit()
+;(function()
 -- ══════════════════════════════════════════════════════════════
 -- TIME TRIAL TAB — auto-start, auto-leave, status
 -- ══════════════════════════════════════════════════════════════
@@ -5188,26 +5437,62 @@ do
         board.cache = { entries = {}, timer = nil, lastSeen = 0 }
     end
 
-    -- Find a SurfaceGui whose title matches the given pattern, return its root container
+    -- Find a SurfaceGui whose title matches the given pattern, return its root container.
+    -- Cached after first find to avoid repeated workspace:GetDescendants() walks (which
+    -- caused 100-500ms lag spikes in late TT when workspace has thousands of mobs).
+    local _boardRootCache = {}  -- [titlePattern] = { root = Model, ttl = expiry }
+    local _ROOT_TTL = 60        -- re-search at most once a minute if cache miss
+
     local function findBoardRootByTitle(titlePattern)
+        local cached = _boardRootCache[titlePattern]
+        if cached and cached.root and cached.root.Parent then
+            return cached.root
+        end
+        if cached and cached.ttl and os.clock() < cached.ttl then
+            return nil  -- recently searched, no hit, don't re-walk yet
+        end
+        -- Walk workspace ONCE, find all leaderboard SurfaceGuis at the same time
         for _, inst in ipairs(workspace:GetDescendants()) do
             if inst:IsA("SurfaceGui") then
-                for _, lbl in ipairs(inst:GetDescendants()) do
+                for _, lbl in ipairs(inst:GetChildren()) do  -- only direct children, not full descend
                     if lbl:IsA("TextLabel") then
                         local t = tostring(lbl.Text or ""):upper()
-                        if t:find(titlePattern, 1, true) then
-                            -- Walk up until parent is workspace (or one below)
-                            local p = inst.Parent
-                            while p and p.Parent and p.Parent ~= workspace do
-                                p = p.Parent
+                        for _, def in ipairs(BOARD_DEFS) do
+                            if t:find(def.titlePattern, 1, true) then
+                                local p = inst.Parent
+                                while p and p.Parent and p.Parent ~= workspace do
+                                    p = p.Parent
+                                end
+                                _boardRootCache[def.titlePattern] = { root = p or inst.Parent, ttl = os.clock() + _ROOT_TTL }
+                                break
                             end
-                            return p or inst.Parent
                         end
                     end
                 end
             end
         end
+        local hit = _boardRootCache[titlePattern]
+        if hit and hit.root then return hit.root end
+        _boardRootCache[titlePattern] = { ttl = os.clock() + _ROOT_TTL }  -- mark searched, no hit
         return nil
+    end
+
+    -- Cheap proximity check: are we anywhere near the TT lobby (where boards live)?
+    -- Avoids the scrape entirely if the player is across the map farming.
+    local function isNearAnyBoard()
+        local char = LP.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if not hrp then return false end
+        local lobby = workspace:FindFirstChild("TimeTrialsLobby")
+        if not lobby then return false end
+        local lobbyPos
+        local pivotOk, pivot = pcall(function() return lobby:GetPivot() end)
+        if pivotOk and pivot then lobbyPos = pivot.Position
+        else
+            local p = lobby:FindFirstChildWhichIsA("BasePart", true)
+            if p then lobbyPos = p.Position else return false end
+        end
+        return (hrp.Position - lobbyPos).Magnitude < 200  -- within 200 studs
     end
 
     -- Scrape a single board. unitWord is lowercase (e.g. "ascends", "stages").
@@ -5448,14 +5733,16 @@ do
         end)
     end)
     local lbAutoRefresh = { active = false }
-    LeaderboardTab:Toggle("⏲ Auto-Refresh (30s)", "Refresh leaderboard every 30 seconds while enabled", false, function(on)
+    LeaderboardTab:Toggle("⏲ Auto-Refresh (30s)", "Refresh guilds + in-server players every 30s; world boards only scrape when near them", false, function(on)
         lbAutoRefresh.active = on == true
         if not lbAutoRefresh.active then return end
         task.spawn(function()
             while lbAutoRefresh.active do
                 refreshGuilds()
                 refreshServerPlayers()
-                scrapeAllBoards()
+                if isNearAnyBoard() then
+                    scrapeAllBoards()
+                end
                 for _ = 1, 30 do
                     if not lbAutoRefresh.active then return end
                     task.wait(1)
@@ -5464,18 +5751,21 @@ do
         end)
     end)
 
-    -- Background watcher: while standing near any world board, rows exist.
-    -- Quietly poll every 5s to keep all caches fresh without user action.
+    -- Background watcher: only scrapes when player is near the leaderboard area.
+    -- Skips entirely when farming far from lobby — was causing major lag spikes
+    -- in late TT because the scrape walked workspace:GetDescendants() which
+    -- includes thousands of mobs/weapons/effects.
     task.spawn(function()
         while GEN == _G.MeleeRNG_Gen do
-            task.wait(5)
+            task.wait(15)  -- slowed from 5s to 15s — boards don't change rapidly
             if GEN ~= _G.MeleeRNG_Gen then return end
-            pcall(scrapeAllBoards)
+            if isNearAnyBoard() then
+                pcall(scrapeAllBoards)
+            end
         end
     end)
 end
-end -- meleeExtraTabsInit
-meleeExtraTabsInit()
+end)()
 
 MiscTab:Section("Community")
 MiscTab:Button("💬", "Join Discord", "Opens discord.gg/ErGUHtVK in browser", C.purple, function()
@@ -5650,29 +5940,83 @@ task.defer(function()
     end)
 end)
 -- Apply Always Hide Mobs at load + on every respawn
+-- Retries until verified — fixes race where SetSetting/Mobs folder isn't replicated yet at boot.
 task.defer(function()
     if not states.alwaysHideMobs then return end
-    local function applyHideMobs()
-        pcall(function()
+
+    -- Returns true if the setting is verifiably ON (Mobs is in RS + game button shows ON)
+    local function verifyHideMobsOn()
+        local mobs = workspace:FindFirstChild("Mobs") or RS:FindFirstChild("Mobs")
+        if not mobs then return false end
+        return mobs.Parent == RS
+    end
+
+    local function fireOnce()
+        local ok = pcall(function()
             local mobs = workspace:FindFirstChild("Mobs") or RS:FindFirstChild("Mobs")
             if mobs and mobs.Parent ~= RS then
                 mobs.Parent = RS
             end
-            local setSetting = RS:FindFirstChild("Remotes") and RS.Remotes:FindFirstChild("SetSetting")
-            if setSetting then setSetting:FireServer("HideMobs", true) end
+            local remotes = RS:FindFirstChild("Remotes")
+            local setSetting = remotes and remotes:FindFirstChild("SetSetting")
+            if setSetting then
+                setSetting:FireServer("HideMobs", true)
+            end
             local btn = LP.PlayerGui:FindFirstChild("MainGUI")
             btn = btn and btn:FindFirstChild("OptionsList")
             btn = btn and btn:FindFirstChild("HideMobsBtn")
             local lbl = btn and btn:FindFirstChild("TextLabel")
             if lbl then lbl.Text = "HIDE MOBS: ON" end
         end)
+        return ok
     end
-    applyHideMobs()
+
+    -- Retry loop: try every 0.5s for up to 15 seconds, stop early on success
+    local function applyWithRetry()
+        if not states.alwaysHideMobs then return end
+        for attempt = 1, 30 do
+            if not states.alwaysHideMobs then return end
+            fireOnce()
+            task.wait(0.3)
+            if verifyHideMobsOn() then
+                -- Success — but the server may reset it during a respawn or area change.
+                -- Keep a passive watchdog running for the rest of the session.
+                break
+            end
+            task.wait(0.2)
+        end
+    end
+
+    -- Initial apply (with retry)
+    applyWithRetry()
+
+    -- Respawn re-apply
     addConn(LP.CharacterAdded:Connect(function()
         if not states.alwaysHideMobs then return end
         task.wait(1.5)
-        applyHideMobs()
+        applyWithRetry()
     end))
+
+    -- Persistent watchdog: if Mobs gets reparented back to workspace by the server
+    -- (happens on TT entry, area changes, etc.), re-fire silently.
+    addConn(workspace.ChildAdded:Connect(function(c)
+        if c.Name == "Mobs" and states.alwaysHideMobs then
+            task.wait(0.1)
+            if states.alwaysHideMobs and not verifyHideMobsOn() then
+                fireOnce()
+            end
+        end
+    end))
+end)
+-- Apply Mob Heavy Optimize at load if saved on
+task.defer(function()
+    if not states.perfMobOptimize then return end
+    task.wait(2) -- let mobs folder populate
+    if _G.MeleeRNG_mobOpt and _G.MeleeRNG_mobOpt.enable then
+        pcall(_G.MeleeRNG_mobOpt.enable)
+    else
+        warn("[MobOpt] _G.MeleeRNG_mobOpt not initialized — IIFE may have failed at load")
+    end
 end)
 -- Apply saved UI button visibility on load
 task.defer(function()
