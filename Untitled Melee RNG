@@ -3835,34 +3835,48 @@ _G.MeleeRNG_mobOpt = (function()
         end
     end
 
+    -- Debounced batch optimizer. Per-mob ChildAdded was causing massive
+    -- lag spikes during stage transitions (200+ mobs spawning at once = 200
+    -- task.wait threads + 200 GetDescendants walks). Now we collect new mobs
+    -- into a queue and sweep them all in one batch ~1s later.
+    local _mobQueue = {}
+    local _mobQueueScheduled = false
+    local function queueMob(child)
+        if not (child and child:IsA("Model")) then return end
+        _mobQueue[#_mobQueue + 1] = child
+        if _mobQueueScheduled then return end
+        _mobQueueScheduled = true
+        task.delay(1.0, function()
+            local batch = _mobQueue
+            _mobQueue = {}
+            _mobQueueScheduled = false
+            for _, mob in ipairs(batch) do
+                if mob and mob.Parent then
+                    perfOptimizeOneMob(mob)
+                end
+            end
+        end)
+    end
+
     local function enable()
         local wsMobs = workspace:FindFirstChild("Mobs")
         if wsMobs then
             perfMobOptimizerSweepFolder(wsMobs)
             if _perfMobConn then _perfMobConn:Disconnect() end
-            _perfMobConn = wsMobs.ChildAdded:Connect(function(child)
-                task.wait(0.1)
-                perfOptimizeOneMob(child)
-            end)
+            _perfMobConn = wsMobs.ChildAdded:Connect(queueMob)
         end
         local rsMobs = RS:FindFirstChild("Mobs")
         if rsMobs then
             perfMobOptimizerSweepFolder(rsMobs)
             if _perfMobConnRS then _perfMobConnRS:Disconnect() end
-            _perfMobConnRS = rsMobs.ChildAdded:Connect(function(child)
-                task.wait(0.1)
-                perfOptimizeOneMob(child)
-            end)
+            _perfMobConnRS = rsMobs.ChildAdded:Connect(queueMob)
         end
         addConn(workspace.ChildAdded:Connect(function(c)
             if c.Name == "Mobs" and states.perfMobOptimize then
                 task.wait(0.05)
                 perfMobOptimizerSweepFolder(c)
                 if _perfMobConn then _perfMobConn:Disconnect() end
-                _perfMobConn = c.ChildAdded:Connect(function(child)
-                    task.wait(0.1)
-                    perfOptimizeOneMob(child)
-                end)
+                _perfMobConn = c.ChildAdded:Connect(queueMob)
             end
         end))
         addConn(RS.ChildAdded:Connect(function(c)
@@ -3870,10 +3884,7 @@ _G.MeleeRNG_mobOpt = (function()
                 task.wait(0.05)
                 perfMobOptimizerSweepFolder(c)
                 if _perfMobConnRS then _perfMobConnRS:Disconnect() end
-                _perfMobConnRS = c.ChildAdded:Connect(function(child)
-                    task.wait(0.1)
-                    perfOptimizeOneMob(child)
-                end)
+                _perfMobConnRS = c.ChildAdded:Connect(queueMob)
             end
         end))
     end
@@ -3908,6 +3919,8 @@ local _perfHitboxAcc = 0
 
 local _ttSessionId    = nil    -- set by UpdateTimeTrialLobby when we're owner
 local _ttTrialActive  = false  -- true while trial is running
+local _ttLastStageN   = 0      -- cache: highest Room_N seen (avoids walking growing dungeon every tick)
+local _ttLastStageRoom = nil   -- cache: ref to that latest Room_N model
 
 addThread(task.spawn(function()
     local remotes = game:GetService("ReplicatedStorage"):WaitForChild("Remotes", 10)
@@ -3930,6 +3943,7 @@ addThread(task.spawn(function()
     if not startEv then return end
     startEv.OnClientEvent:Connect(function(p77)
         _ttTrialActive = p77 and true or false
+        if not _ttTrialActive then _ttLastStageN = 0; _ttLastStageRoom = nil end
     end)
 end))
 
@@ -3945,13 +3959,25 @@ addThread(task.spawn(function()
                 if not root then return end
                 local dungeon = workspace:FindFirstChild("GeneratedDungeon")
                 if not dungeon then return end
-                -- Find current stage room (highest Room_N index)
-                local latestRoom, latestN = nil, 0
-                for _, room in ipairs(dungeon:GetChildren()) do
+                -- Find current stage room (highest Room_N index).
+                -- Optimization: dungeon accumulates rooms over time. Instead of
+                -- walking all children every tick, we start from the cached
+                -- last-known-N and only check forward.
+                local rooms = dungeon:GetChildren()
+                local latestRoom, latestN = nil, _ttLastStageN or 0
+                for i = 1, #rooms do
+                    local room = rooms[i]
                     local n = tonumber(room.Name:match("^Room_(%d+)$"))
                     if n and n > latestN then latestN = n; latestRoom = room end
                 end
-                if not latestRoom then return end
+                if not latestRoom then
+                    -- nothing newer than cached; reuse cached room if still valid
+                    latestRoom = _ttLastStageRoom
+                    if not (latestRoom and latestRoom.Parent) then return end
+                else
+                    _ttLastStageRoom = latestRoom
+                    _ttLastStageN = latestN
+                end
                 -- Leave at target stage if set
                 local leaveAt = states.ttLeaveAtStage
                 if leaveAt and leaveAt > 0 and latestN >= leaveAt then
