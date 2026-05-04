@@ -402,6 +402,7 @@ local states = {
     perfLowGraphicsQuality = false, -- UserGameSettings quality (executor/client dependent)
     perfHideOtherCharacters = false, -- other players’ Character rigs invisible locally (intrusive)
     perfMobOptimize      = false, -- TT lag fix: disable mob animations/physics/sounds/VFX (combat unaffected)
+    dpsTrackingEnabled   = false, -- DPS hook installs only if true; opt-in because hookmetamethod adds overhead to every namecall in the game
 }
 
 -- Auto Farm cycle: live status (not in states — avoids persisting to settings JSON)
@@ -590,6 +591,7 @@ states.perfCompatLighting = states.perfCompatLighting == true
 states.perfLowGraphicsQuality = states.perfLowGraphicsQuality == true
 states.perfHideOtherCharacters = states.perfHideOtherCharacters == true
 states.perfMobOptimize = states.perfMobOptimize == true
+states.dpsTrackingEnabled = states.dpsTrackingEnabled == true
 states.uiHideManaKills = states.uiHideManaKills == true
 states.uiHideMiniRoll  = states.uiHideMiniRoll == true
 states.uiHideHud       = states.uiHideHud == true
@@ -1203,13 +1205,51 @@ local function meleeGuiMountMiscStatsLabelsAscendAura(MiscTab, SLbl, C, guildApG
     -- game's controllers because the wrapper mangled return values for
     -- unrelated namecalls. This version uses no wrapper — passes (...) through
     -- to oldNamecall verbatim, only observing when the target matches HitMob.
-    local _dpsWindow = {}
+    -- DPS tracker: hooks __namecall but the hot path is allocation-free.
+    -- Critical: every namecall in the entire game flows through this filter,
+    -- so anything we do on the common path (self != hitMob) must be cheap.
+    -- Storage: two parallel flat arrays (times + dmgs) instead of a table-of-
+    -- tables, so each captured event is just two number slots — no per-entry
+    -- table allocation = far less GC pressure on long sessions.
+    local _dpsTimes = {}
+    local _dpsDmgs  = {}
+    local _dpsCount = 0
     local _dpsWindowSec = 5
     local _dpsTotalDmg = 0
     local _dpsPeak = 0
     local _dpsHookOk = false
 
+    local function dpsObserve(buffer)
+        if type(buffer) ~= "table" then return end
+        local now = os.clock()
+        for i = 1, #buffer do
+            local entry = buffer[i]
+            if type(entry) == "table" then
+                local dmg = tonumber(entry[2])
+                if dmg and dmg > 0 then
+                    _dpsTotalDmg = _dpsTotalDmg + dmg
+                    _dpsCount = _dpsCount + 1
+                    _dpsTimes[_dpsCount] = now
+                    _dpsDmgs[_dpsCount]  = dmg
+                    -- In-place trim if cap exceeded (no temp table)
+                    if _dpsCount > 5000 then
+                        for j = 1, 2500 do
+                            _dpsTimes[j] = _dpsTimes[j + 2500]
+                            _dpsDmgs[j]  = _dpsDmgs[j + 2500]
+                        end
+                        for j = 2501, _dpsCount do
+                            _dpsTimes[j] = nil
+                            _dpsDmgs[j]  = nil
+                        end
+                        _dpsCount = 2500
+                    end
+                end
+            end
+        end
+    end
+
     task.spawn(function()
+        if not states.dpsTrackingEnabled then return end  -- opt-in only
         local remotes = RS:WaitForChild("Remotes", 30)
         if not remotes then return end
         local hitMob = remotes:WaitForChild("HitMob", 30)
@@ -1222,31 +1262,8 @@ local function meleeGuiMountMiscStatsLabelsAscendAura(MiscTab, SLbl, C, guildApG
 
         local oldNamecall
         oldNamecall = hmm(game, "__namecall", function(self, ...)
-            if self == hitMob and not checkcaller() then
-                local method = gnm()
-                if method == "FireServer" then
-                    pcall(function(buffer)
-                        if type(buffer) == "table" then
-                            for _, entry in ipairs(buffer) do
-                                if type(entry) == "table" then
-                                    local dmg = tonumber(entry[2])
-                                    if dmg and dmg > 0 then
-                                        _dpsTotalDmg = _dpsTotalDmg + dmg
-                                        _dpsWindow[#_dpsWindow + 1] = { t = os.clock(), dmg = dmg }
-                                        -- Hard cap: prevent unbounded growth on extreme KPM. If we have
-                                        -- more than 5000 entries (way more than 5 sec of damage at any
-                                        -- realistic rate), drop the oldest half to keep memory in check.
-                                        if #_dpsWindow > 5000 then
-                                            local kept = {}
-                                            for i = 2500, #_dpsWindow do kept[#kept + 1] = _dpsWindow[i] end
-                                            _dpsWindow = kept
-                                        end
-                                    end
-                                end
-                            end
-                        end
-                    end, (...))
-                end
+            if self == hitMob and gnm() == "FireServer" and not checkcaller() then
+                dpsObserve((...))
             end
             return oldNamecall(self, ...)
         end)
@@ -1257,16 +1274,26 @@ local function meleeGuiMountMiscStatsLabelsAscendAura(MiscTab, SLbl, C, guildApG
     local function getDPS()
         local now = os.clock()
         local cutoff = now - _dpsWindowSec
-        local i = 1
-        while i <= #_dpsWindow and _dpsWindow[i].t < cutoff do
-            i = i + 1
+        -- Find first index whose time >= cutoff
+        local first = 1
+        while first <= _dpsCount and _dpsTimes[first] < cutoff do
+            first = first + 1
         end
-        if i > 1 then
-            for j = 1, #_dpsWindow - i + 1 do _dpsWindow[j] = _dpsWindow[j + i - 1] end
-            for j = #_dpsWindow - i + 2, #_dpsWindow do _dpsWindow[j] = nil end
+        -- Compact: shift live entries to front
+        if first > 1 then
+            local newCount = _dpsCount - first + 1
+            for j = 1, newCount do
+                _dpsTimes[j] = _dpsTimes[j + first - 1]
+                _dpsDmgs[j]  = _dpsDmgs[j + first - 1]
+            end
+            for j = newCount + 1, _dpsCount do
+                _dpsTimes[j] = nil
+                _dpsDmgs[j]  = nil
+            end
+            _dpsCount = newCount
         end
         local sum = 0
-        for _, e in ipairs(_dpsWindow) do sum = sum + e.dmg end
+        for i = 1, _dpsCount do sum = sum + _dpsDmgs[i] end
         local dps = sum / _dpsWindowSec
         if dps > _dpsPeak then _dpsPeak = dps end
         return dps
@@ -1279,8 +1306,14 @@ local function meleeGuiMountMiscStatsLabelsAscendAura(MiscTab, SLbl, C, guildApG
         elseif n >= 1e3 then return string.format("%.1fK", n / 1e3)
         else return tostring(math.floor(n)) end
     end
+    MiscTab:Toggle("📊 DPS Tracking (lab/heavy)", "Hooks Roblox __namecall to capture damage. Adds overhead on every game call — disable if you're seeing crashes/lag. Requires script reload to take effect — saved", states.dpsTrackingEnabled, function(on)
+        states.dpsTrackingEnabled = on == true
+        saveSettings()
+        SLbl.Text = on and "DPS tracking ON (re-execute to apply)" or "DPS tracking OFF (re-execute to fully detach)"
+    end)
     MiscTab:Button("🔄", "Reset DPS Stats", "Clears peak DPS + total damage", C.gray or C.purple, function()
-        _dpsWindow = {}
+        for i = 1, _dpsCount do _dpsTimes[i] = nil; _dpsDmgs[i] = nil end
+        _dpsCount = 0
         _dpsTotalDmg = 0
         _dpsPeak = 0
         SLbl.Text = "DPS stats reset"
@@ -1328,14 +1361,18 @@ local function meleeGuiMountMiscStatsLabelsAscendAura(MiscTab, SLbl, C, guildApG
                     ETALbl.Set("Ascend: —")
                 end
                 -- DPS update
-                local dps = getDPS()
-                if not _dpsHookOk then
-                    DPSLbl.Set("DPS: [hook attaching...]")
-                elseif _dpsTotalDmg == 0 then
-                    DPSLbl.Set("DPS: [waiting for first damage]")
+                if not states.dpsTrackingEnabled then
+                    DPSLbl.Set("DPS: [tracking disabled — see Misc toggle]")
                 else
-                    DPSLbl.Set(string.format("DPS: %s | Peak: %s | Total: %s",
-                        fmtDmg(dps), fmtDmg(_dpsPeak), fmtDmg(_dpsTotalDmg)))
+                    local dps = getDPS()
+                    if not _dpsHookOk then
+                        DPSLbl.Set("DPS: [hook attaching...]")
+                    elseif _dpsTotalDmg == 0 then
+                        DPSLbl.Set("DPS: [waiting for first damage]")
+                    else
+                        DPSLbl.Set(string.format("DPS: %s | Peak: %s | Total: %s",
+                            fmtDmg(dps), fmtDmg(_dpsPeak), fmtDmg(_dpsTotalDmg)))
+                    end
                 end
                 local eqA = getEquippedAuraName()
                 local rollA = getRolledAuraNameFromRollUi()
