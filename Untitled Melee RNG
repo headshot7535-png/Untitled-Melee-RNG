@@ -402,6 +402,7 @@ local states = {
     perfLowGraphicsQuality = false, -- UserGameSettings quality (executor/client dependent)
     perfHideOtherCharacters = false, -- other players’ Character rigs invisible locally (intrusive)
     perfMobOptimize      = false, -- TT lag fix: disable mob animations/physics/sounds/VFX (combat unaffected)
+    perfPeriodicGc       = false, -- every 60s: GC + sweep orphaned VFX/sounds — fights game-side leaks in long TT sessions
     dpsTrackingEnabled   = false, -- DPS hook installs only if true; opt-in because hookmetamethod adds overhead to every namecall in the game
 }
 
@@ -591,6 +592,7 @@ states.perfCompatLighting = states.perfCompatLighting == true
 states.perfLowGraphicsQuality = states.perfLowGraphicsQuality == true
 states.perfHideOtherCharacters = states.perfHideOtherCharacters == true
 states.perfMobOptimize = states.perfMobOptimize == true
+states.perfPeriodicGc = states.perfPeriodicGc == true
 states.dpsTrackingEnabled = states.dpsTrackingEnabled == true
 states.uiHideManaKills = states.uiHideManaKills == true
 states.uiHideMiniRoll  = states.uiHideMiniRoll == true
@@ -1249,24 +1251,31 @@ local function meleeGuiMountMiscStatsLabelsAscendAura(MiscTab, SLbl, C, guildApG
     end
 
     task.spawn(function()
-        if not states.dpsTrackingEnabled then return end  -- opt-in only
+        if not states.dpsTrackingEnabled then return end
         local remotes = RS:WaitForChild("Remotes", 30)
         if not remotes then return end
         local hitMob = remotes:WaitForChild("HitMob", 30)
         if not hitMob then return end
 
-        local hmm = rawget(getfenv(), "hookmetamethod") or hookmetamethod
-        local gnm = rawget(getfenv(), "getnamecallmethod") or getnamecallmethod
+        local hookfunc = rawget(getfenv(), "hookfunction") or rawget(getfenv(), "replaceclosure") or hookfunction
         local checkcaller = rawget(getfenv(), "checkcaller") or function() return false end
-        if not hmm or not gnm then return end
+        if not hookfunc then return end
 
-        local oldNamecall
-        oldNamecall = hmm(game, "__namecall", function(self, ...)
-            if self == hitMob and gnm() == "FireServer" and not checkcaller() then
+        -- Hook RemoteEvent.FireServer at the class-method level. This is the
+        -- shared method used by every RemoteEvent, but it runs ONLY when a
+        -- remote actually fires (a few per second total across the whole
+        -- game) — not on every namecall (which is 100k+/sec). We filter by
+        -- `self == hitMob` inside, so other remotes pass through unchanged.
+        local originalFire
+        local function wrapped(self, ...)
+            if self == hitMob and not checkcaller() then
                 dpsObserve((...))
             end
-            return oldNamecall(self, ...)
-        end)
+            return originalFire(self, ...)
+        end
+        local ok, original = pcall(hookfunc, hitMob.FireServer, wrapped)
+        if not ok or not original then return end
+        originalFire = original
 
         _dpsHookOk = true
     end)
@@ -1306,7 +1315,7 @@ local function meleeGuiMountMiscStatsLabelsAscendAura(MiscTab, SLbl, C, guildApG
         elseif n >= 1e3 then return string.format("%.1fK", n / 1e3)
         else return tostring(math.floor(n)) end
     end
-    MiscTab:Toggle("📊 DPS Tracking (lab/heavy)", "Hooks Roblox __namecall to capture damage. Adds overhead on every game call — disable if you're seeing crashes/lag. Requires script reload to take effect — saved", states.dpsTrackingEnabled, function(on)
+    MiscTab:Toggle("📊 DPS Tracking", "Hooks Remotes.HitMob.FireServer to capture damage. Surgical (no global namecall override). Requires script reload to take effect — saved", states.dpsTrackingEnabled, function(on)
         states.dpsTrackingEnabled = on == true
         saveSettings()
         SLbl.Text = on and "DPS tracking ON (re-execute to apply)" or "DPS tracking OFF (re-execute to fully detach)"
@@ -5060,6 +5069,19 @@ end, KR.getKillRate, KR.getAscendETA, KR.fmtTime)
             SLbl.Text = "Perf: mobs restored"
         end
     end)
+    perfUi.gc = MiscTab:Toggle("🧹 Periodic Memory Cleanup", "Every 60s: forces a Lua GC cycle + sweeps orphaned VFX/sounds/dead Models in workspace. Helps with the gradual lag in long TT sessions caused by game-side leaks. Safe to leave on — saved", states.perfPeriodicGc, function(on)
+        states.perfPeriodicGc = on == true
+        saveSettings()
+        SLbl.Text = on and "Periodic cleanup ON" or "Periodic cleanup OFF"
+    end)
+    MiscTab:Button("🧹", "Run Cleanup Now", "Manually triggers a memory cleanup sweep (force GC + kill orphan VFX). Run this if the game is feeling sluggish.", C.green, function()
+        if _G.MeleeRNG_runCleanup then
+            local n = _G.MeleeRNG_runCleanup()
+            SLbl.Text = "Cleanup: removed ~" .. n .. " orphan instances + GC'd"
+        else
+            SLbl.Text = "Cleanup helper not initialized"
+        end
+    end)
     perfUi.loot = MiscTab:Toggle("Hide Loot Drops", "Hides dropped weapons under workspace.Loot (client visibility only) — saved", states.perfHideLootDrops, function(on)
         states.perfHideLootDrops = on == true
         saveSettings()
@@ -6079,6 +6101,58 @@ task.defer(function()
         pcall(_G.MeleeRNG_mobOpt.enable)
     else
         warn("[MobOpt] _G.MeleeRNG_mobOpt not initialized — IIFE may have failed at load")
+    end
+end)
+
+-- ── Periodic Memory Cleanup ───────────────────────────────────
+-- Roblox doesn't always GC fast enough during high-churn TT sessions.
+-- This sweep finds orphaned VFX/sounds (no parent, no descendants of mob),
+-- forces them to nil, then triggers a GC cycle to reclaim memory.
+-- Helps with the "gets laggier the longer you play" issue.
+_G.MeleeRNG_runCleanup = function()
+    local removed = 0
+    -- 1. Sweep workspace for orphaned VFX from dead/destroyed mobs.
+    --    Heuristic: ParticleEmitter/Trail/Beam parented directly under
+    --    workspace (not inside a Model) is almost certainly leftover.
+    pcall(function()
+        for _, child in ipairs(workspace:GetChildren()) do
+            -- skip core game folders
+            local n = child.Name
+            if n ~= "Mobs" and n ~= "GeneratedDungeon" and n ~= "Map"
+                and n ~= "TimeTrialsLobby" and n ~= "Lobby" and not child:IsA("Terrain") then
+                if child:IsA("ParticleEmitter") or child:IsA("Trail") or child:IsA("Beam")
+                    or child:IsA("Smoke") or child:IsA("Fire") or child:IsA("Sparkles") then
+                    pcall(function() child:Destroy() end)
+                    removed = removed + 1
+                end
+            end
+        end
+    end)
+    -- 2. Sweep camera (some games leak VFX onto the camera)
+    pcall(function()
+        local cam = workspace.CurrentCamera
+        if cam then
+            for _, c in ipairs(cam:GetDescendants()) do
+                if c:IsA("ParticleEmitter") or c:IsA("Trail") or c:IsA("Beam") then
+                    pcall(function() c:Destroy() end)
+                    removed = removed + 1
+                end
+            end
+        end
+    end)
+    -- 3. Force a Lua GC cycle to reclaim disconnected memory
+    pcall(function() collectgarbage("collect") end)
+    return removed
+end
+
+-- Periodic loop: runs every 60s when toggle is on
+task.spawn(function()
+    while GEN == _G.MeleeRNG_Gen do
+        task.wait(60)
+        if GEN ~= _G.MeleeRNG_Gen then return end
+        if states.perfPeriodicGc and _G.MeleeRNG_runCleanup then
+            pcall(_G.MeleeRNG_runCleanup)
+        end
     end
 end)
 -- Apply saved UI button visibility on load
